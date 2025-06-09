@@ -1,0 +1,1297 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.session import get_db, get_feishu_service
+from app.services.feishu_service import FeishuService
+from typing import Dict, List, Optional
+from pydantic import BaseModel
+from datetime import datetime
+from sqlalchemy import select, update
+from sqlalchemy import func
+from app.models.doc_subscription import DocSubscription
+from app.core.config import settings
+from app.core.logger import setup_logger
+import os
+import tempfile
+from pathlib import Path
+from app.utils.doc_block_filter import DocBlockFilter
+from app.utils.block_to_markdown import BlockToMarkdown
+
+logger = setup_logger("document_api")
+
+router = APIRouter()
+
+# 请求模型
+class DocSubscribeRequest(BaseModel):
+    app_id: str
+    file_token: str
+    file_type: str
+    space_id: Optional[str] = None  # 所属知识空间ID，可选
+    title: Optional[str] = None     # 文档标题，可选
+    obj_edit_time: Optional[str] = None  # 文档最后编辑时间，可选
+
+class SpaceSubscribeRequest(BaseModel):
+    app_id: str
+    space_id: str
+
+class UpdateAIChatTimeRequest(BaseModel):
+    app_id: str
+    file_token: str
+    success: bool = True
+
+class SyncDocToAIChatRequest(BaseModel):
+    app_id: str
+    file_token: str
+    file_type: str
+    hierarchy_changed: bool = False  # 新增参数，默认为False
+
+class TestImageRequest(BaseModel):
+    app_id: str
+    doc_token: str
+
+class TestSheetRequest(BaseModel):
+    app_id: str
+    sheet_token: str
+
+# 响应模型
+class SubscribeResponse(BaseModel):
+    code: int
+    msg: str = ""
+    data: Optional[Dict] = None
+
+# 订阅文档事件
+@router.post("/subscribe", response_model=SubscribeResponse)
+async def subscribe_document_events(
+    request: DocSubscribeRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """订阅云文档事件
+    
+    订阅后，当文档发生编辑、标题更新、权限变更等事件时，
+    将通过回调接口推送通知
+    """
+    result = await feishu_service.subscribe_doc_events(
+        request.app_id, 
+        request.file_token,
+        request.file_type,
+        request.title,  # 传递title参数
+        request.space_id,  # 传递space_id参数
+        request.obj_edit_time  # 传递obj_edit_time参数
+    )
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 订阅知识空间下所有文档事件
+@router.post("/subscribe-space", response_model=SubscribeResponse)
+async def subscribe_space_documents(
+    request: SpaceSubscribeRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """订阅知识空间下所有文档事件
+    
+    遍历指定知识空间下的所有文档并订阅事件，
+    仅订阅docx类型的文档
+    """
+    result = await feishu_service.subscribe_space_documents(
+        request.app_id,
+        request.space_id
+    )
+    
+    return {
+        "code": result.get("code", 0),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 取消订阅文档事件
+@router.post("/unsubscribe", response_model=SubscribeResponse)
+async def unsubscribe_document_events(
+    request: DocSubscribeRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """取消订阅云文档事件"""
+    result = await feishu_service.unsubscribe_doc_events(
+        request.app_id, 
+        request.file_token,
+        request.file_type
+    )
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 获取文档内容
+@router.get("/{app_id}/{doc_token}", response_model=SubscribeResponse)
+async def get_document_content(
+    app_id: str,
+    doc_token: str,
+    doc_type: str = "docx",
+    content_type: str = "markdown",
+    use_filtered_blocks: bool = Query(True, description="是否使用我们自己实现的filtered-blocks处理逻辑"),
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取文档内容"""
+    result = await feishu_service.get_doc_content(
+        app_id,
+        doc_token,
+        doc_type,
+        content_type,
+        use_filtered_blocks=use_filtered_blocks
+    )
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 获取已订阅文档列表
+@router.get("/subscribed", response_model=SubscribeResponse)
+async def get_subscribed_documents(
+    app_id: str,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取已订阅的文档列表
+    
+    从数据库中查询已订阅的文档列表，无需调用飞书API
+    """
+    result = await feishu_service.get_subscribed_documents(app_id)
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 更新文档AI知识库时间
+@router.post("/update-aichat-time", response_model=SubscribeResponse)
+async def update_document_aichat_time(
+    request: UpdateAIChatTimeRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """更新文档AI知识库同步时间
+    
+    在文档内容成功同步到AI知识库后调用此接口，记录同步时间
+    """
+    success = await feishu_service.update_doc_aichat_time(
+        request.app_id,
+        request.file_token,
+        request.success
+    )
+    
+    if success:
+        return {
+            "code": 0,
+            "msg": "更新AI知识库同步时间成功"
+        }
+    else:
+        return {
+            "code": -1,
+            "msg": "更新AI知识库同步时间失败"
+        }
+
+# 获取需要同步到AI知识库的文档列表
+@router.get("/aichat-sync", response_model=SubscribeResponse)
+async def get_documents_for_aichat_sync(
+    app_id: str,
+    limit: int = Query(100, description="返回的最大文档数量"),
+    file_token: str = Query(None, description="指定文档Token，可选"),
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取需要同步到AI知识库的文档列表
+    
+    获取满足以下条件的文档:
+    1. 已订阅
+    2. obj_edit_time > aichat_update_time 或 aichat_update_time为空
+    
+    如果指定file_token，则只返回该文档的信息，不考虑上述条件
+    """
+    result = await feishu_service.get_docs_for_aichat_sync(app_id, limit, file_token)
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 手动和自动同步文档到AI知识库
+@router.post("/sync-to-aichat", response_model=SubscribeResponse)
+async def manual_sync_to_aichat(
+    request: SyncDocToAIChatRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """手动同步文档到AI知识库
+    
+    支持两种类型的文件：
+    1. 云文档类型(docx)：读取文档内容，转为markdown上传
+    2. PDF文件：下载文件后直接上传到FastGPT
+    
+    同步过程包括：
+    1. 获取文档内容或下载PDF文件
+    2. 查找或创建与app_name同名的文件夹
+    3. 根据知识空间名称创建子文件夹
+    4. 根据配置创建产品资料、项目资料等固定文件夹
+    5. 同步文档内容到知识库
+    6. 更新文档同步时间
+    """
+    # 直接调用同步函数
+    result = await sync_document_to_aichat(request, feishu_service)
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 获取文档中的所有图片信息
+@router.get("/{app_id}/{doc_token}/images", response_model=SubscribeResponse)
+async def get_document_images(
+    app_id: str,
+    doc_token: str,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取文档中的所有图片信息
+    
+    获取云文档中的所有图片块，返回包含block_id、image_token等信息的列表
+    """
+    result = await feishu_service.get_document_images(app_id, doc_token)
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 下载文档中的图片
+@router.get("/{app_id}/image/{image_token}/download", response_model=SubscribeResponse)
+async def download_image(
+    app_id: str,
+    image_token: str,
+    filename: str = Query(None, description="图片保存的文件名，不提供则使用image_token作为文件名"),
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """下载文档中的图片
+    
+    基于image_token下载图片，保存到临时目录并返回文件路径
+    """
+    # 如果未提供文件名，使用image_token
+    if not filename:
+        filename = f"{image_token}.png"  # 默认使用png扩展名
+    
+    # 创建temp/images目录用于保存图片
+    import os
+    from pathlib import Path
+    temp_dir = Path("temp/images")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 构建输出路径
+    output_path = str(temp_dir / filename)
+    
+    # 下载图片
+    result = await feishu_service.download_image(app_id, image_token, output_path)
+    
+    if result.get("code") == 0:
+        # 添加文件URL信息
+        file_path = result.get("data", {}).get("file_path")
+        if file_path:
+            # 构建相对URL路径，不暴露服务器绝对路径
+            relative_path = os.path.relpath(file_path).replace("\\", "/")
+            result["data"]["url"] = f"/static/{relative_path}"
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 获取文档所有块（原始数据）
+@router.get("/{app_id}/{doc_token}/blocks", response_model=SubscribeResponse)
+async def get_document_blocks(
+    app_id: str,
+    doc_token: str,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取文档所有块
+    
+    获取文档所有块的原始数据，包括文本块、图片块等
+    """
+    result = await feishu_service.get_all_document_blocks(app_id, doc_token)
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 测试文档图片功能
+@router.post("/test-image", response_model=SubscribeResponse)
+async def test_document_image(
+    request: TestImageRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """测试获取文档图片功能
+    
+    1. 获取文档中所有图片信息
+    2. 下载第一张图片
+    3. 返回处理结果
+    """
+    app_id = request.app_id
+    doc_token = request.doc_token
+    
+    logger.info(f"开始测试文档图片功能: app_id={app_id}, doc_token={doc_token}")
+    
+    # 步骤1: 获取文档所有图片
+    images_result = await feishu_service.get_document_images(app_id, doc_token)
+    
+    if images_result.get("code") != 0:
+        logger.error(f"获取文档图片失败: {images_result.get('msg')}")
+        return {
+            "code": -1,
+            "msg": f"获取文档图片失败: {images_result.get('msg')}",
+            "data": None
+        }
+    
+    # 获取图片列表
+    images = images_result.get("data", {}).get("items", [])
+    total_images = len(images)
+    
+    logger.info(f"文档共有{total_images}张图片")
+    
+    if total_images == 0:
+        return {
+            "code": 0,
+            "msg": "文档中没有图片",
+            "data": {
+                "total_images": 0,
+                "images": []
+            }
+        }
+    
+    # 步骤2: 下载第一张图片
+    first_image = images[0]
+    image_token = first_image.get("image_token")
+    
+    if not image_token:
+        logger.error("图片token为空")
+        return {
+            "code": -1,
+            "msg": "图片token为空",
+            "data": {
+                "total_images": total_images,
+                "images": images
+            }
+        }
+    
+    # 创建临时目录用于保存图片
+    import os
+    from pathlib import Path
+    temp_dir = Path("temp/images")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 构建输出路径
+    filename = f"test_{image_token[:8]}.png"
+    output_path = str(temp_dir / filename)
+    
+    # 下载图片
+    download_result = await feishu_service.download_image(app_id, image_token, output_path)
+    
+    if download_result.get("code") != 0:
+        logger.error(f"[文件处理] 下载文件失败: file_token={request.file_token}, 错误={download_result.get('msg')}")
+        await fastgpt_service.close()
+        
+        # 根据错误类型返回不同的信息
+        error_msg = download_result.get('msg', '下载失败')
+        status_code = download_result.get('status_code')
+        
+        if status_code == 404 or "文件不存在或已被删除" in error_msg:
+            return {
+                "code": -1,
+                "msg": f"文件不存在或已被删除，可能是文件token已过期: {error_msg}",
+                "data": {
+                    "file_token": request.file_token,
+                    "error_type": "file_not_found",
+                    "recoverable": False
+                }
+            }
+        elif status_code == 403 or "无权限访问" in error_msg:
+            return {
+                "code": -1,
+                "msg": f"无权限访问文件: {error_msg}",
+                "data": {
+                    "file_token": request.file_token,
+                    "error_type": "permission_denied",
+                    "recoverable": True
+                }
+            }
+        else:
+            return {
+                "code": -1,
+                "msg": f"下载文件失败: {error_msg}",
+                "data": {
+                    "file_token": request.file_token,
+                    "error_type": "download_failed",
+                    "recoverable": True
+                }
+            }
+
+    # 构建图片URL
+    file_path = download_result.get("data", {}).get("file_path")
+    relative_path = os.path.relpath(file_path).replace("\\", "/")
+    image_url = f"/static/{relative_path}"
+    
+    # 返回结果
+    return {
+        "code": 0,
+        "msg": "成功获取文档图片",
+        "data": {
+            "total_images": total_images,
+            "images": images,
+            "first_image": {
+                "image_token": image_token,
+                "file_path": file_path,
+                "file_size": download_result.get("data", {}).get("file_size"),
+                "image_url": image_url
+            }
+        }
+    }
+
+# 获取过滤后的文档块
+@router.post("/filtered-blocks", response_model=SubscribeResponse)
+async def get_filtered_blocks(
+    request: TestImageRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取过滤后的文档块
+    
+    1. 获取文档所有块
+    2. 使用DocBlockFilter过滤只保留可转为Markdown的通用块
+    3. 返回过滤后的块和树状结构
+    """
+    app_id = request.app_id
+    doc_token = request.doc_token
+    
+    logger.info(f"开始获取并过滤文档块: app_id={app_id}, doc_token={doc_token}")
+    
+    # 获取所有块
+    blocks_result = await feishu_service.get_all_document_blocks(app_id, doc_token)
+    
+    if blocks_result.get("code") != 0:
+        logger.error(f"获取文档块失败: {blocks_result.get('msg')}")
+        return {
+            "code": -1,
+            "msg": f"获取文档块失败: {blocks_result.get('msg')}",
+            "data": None
+        }
+    
+    # 获取文档块列表
+    blocks = blocks_result.get("data", {}).get("items", [])
+    total_blocks = len(blocks)
+    
+    logger.info(f"成功获取文档块: doc_token={doc_token}, 总块数={total_blocks}")
+    
+    if total_blocks == 0:
+        return {
+            "code": 0,
+            "msg": "文档中没有块",
+            "data": {
+                "total_blocks": 0,
+                "blocks": []
+            }
+        }
+    
+    # 使用DocBlockFilter组织块
+    organized_result = DocBlockFilter.organize_blocks(blocks)
+    filtered_blocks = organized_result["blocks"]
+    block_tree = organized_result["tree"]
+    
+    # 使用BlockToMarkdown将块转换为Markdown
+    markdown_content = await BlockToMarkdown.convert(filtered_blocks, app_id=app_id)
+    
+    # 返回结果
+    return {
+        "code": 0,
+        "msg": "成功获取并过滤文档块",
+        "data": {
+            "total_blocks": total_blocks,
+            "filtered_blocks_count": len(filtered_blocks),
+            "filtered_blocks": filtered_blocks,
+            "block_tree": block_tree,
+            "md": markdown_content
+        }
+    }
+
+# 测试FastGPT知识库功能
+@router.post("/test-fastgpt", response_model=SubscribeResponse)
+async def test_fastgpt_integration(
+    request: DocSubscribeRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """测试FastGPT知识库集成功能
+    
+    获取文档内容并尝试同步到FastGPT知识库
+    """
+    try:
+        # 创建飞书服务实例
+        feishu_service = FeishuService(db)
+        
+        # 直接调用更新AI知识库方法
+        success = await feishu_service.update_doc_aichat_time(
+            request.app_id,
+            request.file_token,
+            True
+        )
+        
+        # 关闭服务实例
+        await feishu_service.close()
+        
+        if success:
+            return {
+                "code": 0,
+                "msg": "成功测试FastGPT知识库集成，请查看日志了解详情",
+                "data": {
+                    "file_token": request.file_token,
+                    "success": True
+                }
+            }
+        else:
+            return {
+                "code": -1,
+                "msg": "FastGPT知识库集成测试失败，请查看日志了解详情",
+                "data": {
+                    "file_token": request.file_token,
+                    "success": False
+                }
+            }
+            
+    except Exception as e:
+        return {
+            "code": -1,
+            "msg": f"测试FastGPT知识库集成时发生错误: {str(e)}",
+            "data": None
+        } 
+
+# 同步文档到AI知识库的核心函数
+async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_service: FeishuService) -> dict:
+    """同步文档到AI知识库
+    
+    1. 获取文档内容
+    2. 查找或创建与app_name同名的文件夹
+    3. 根据知识空间名称创建子文件夹
+    4. 根据配置创建产品资料、项目资料等固定文件夹
+    5. 同步文档内容到知识库
+    6. 更新文档同步时间
+    Args:
+        request: 同步请求
+        feishu_service: 飞书服务实例
+        
+    Returns:
+        dict: 同步结果
+    """
+    try:
+        # 获取应用配置，以便获取app_name
+        app_config = next((app for app in settings.FEISHU_APPS if app.app_id == request.app_id), None)
+        
+        if not app_config:
+            return {
+                "code": -1,
+                "msg": f"找不到应用配置: {request.app_id}",
+                "data": None
+            }
+        
+        # 初始化FastGPT服务
+        from app.services.fastgpt_service import FastGPTService
+        fastgpt_service = FastGPTService(request.app_id)
+        
+        try:
+            # 获取文档信息
+            query = await feishu_service.db.execute(
+                select(DocSubscription).where(
+                    DocSubscription.app_id == request.app_id,
+                    DocSubscription.file_token == request.file_token
+                )
+            )
+            doc = query.scalar_one_or_none()
+            
+            if not doc:
+                await fastgpt_service.close()
+                return {
+                    "code": -1,
+                    "msg": f"找不到文档记录: {request.file_token}",
+                    "data": None
+                }
+            
+            # 更新文件类型判断变量
+            is_direct_file_upload = (request.file_type.lower() == "file" and doc.title and (
+                doc.title.lower().endswith('.pdf') or 
+                doc.title.lower().endswith('.docx') or 
+                doc.title.lower().endswith('.xlsx') or
+                doc.title.lower().endswith('.pptx')
+            )) or request.file_type.lower() == "pdf"
+            is_markdown_doc = request.file_type in ["docx", "sheet"]      # 云文档和电子表格，转换为markdown后上传
+            
+            # 对于file类型但不是支持的文件格式，优雅地跳过处理
+            if request.file_type.lower() == "file" and not is_direct_file_upload:
+                logger.info(f"文档类型不支持，跳过处理: {request.file_type}, 标题: {doc.title}")
+                await fastgpt_service.close()
+                return {
+                    "code": 0,
+                    "msg": f"文档类型不支持，已跳过处理: {doc.title}",
+                    "data": {
+                        "file_token": request.file_token,
+                        "skipped": True,
+                        "reason": "不支持的文件类型"
+                    }
+                }
+            
+            # 如果既不是直接文件上传也不是markdown文档，跳过处理
+            if not is_direct_file_upload and not is_markdown_doc:
+                logger.info(f"文档类型不支持，跳过处理: {request.file_type}")
+                await fastgpt_service.close()
+                return {
+                    "code": 0,
+                    "msg": f"文档类型不支持，已跳过处理: {request.file_type}",
+                    "data": {
+                        "file_token": request.file_token,
+                        "skipped": True,
+                        "reason": "不支持的文件类型"
+                    }
+                }
+            
+            # 如果目录发生变化，先删除旧的知识文件记录
+            if doc.collection_id:
+                try:
+                    delete_result = await fastgpt_service.delete_document_from_dataset(doc.collection_id)
+                    if delete_result.get("code") == 0:  # 修改判断条件
+                        logger.info(f"成功删除旧的知识库记录: collection_id={doc.collection_id}")
+                    else:
+                        logger.error(f"删除旧的知识库记录失败: {delete_result.get('msg')}")
+                except Exception as e:
+                    logger.error(f"删除旧的知识库记录异常: {str(e)}")
+            
+            document_content = ""
+            temp_file_path = None
+            
+            # 获取文档内容或下载文件
+            try:
+                # 根据文件类型选择不同的处理方式
+                if is_direct_file_upload:
+                    # 文件需要下载后处理
+                    temp_dir = Path("temp")
+                    temp_dir.mkdir(exist_ok=True)
+                    
+                    # 使用文档标题创建临时文件名（保留原始扩展名）
+                    doc_title = doc.title or f"文档-{request.file_token}"
+                    
+                    # 确保文件名有效，同时保留原始扩展名
+                    file_extension = ""
+                    if doc.title.lower().endswith('.pdf'):
+                        file_extension = '.pdf'
+                    elif doc.title.lower().endswith('.docx'):
+                        file_extension = '.docx'
+                    elif doc.title.lower().endswith('.xlsx'):
+                        file_extension = '.xlsx'
+                    elif doc.title.lower().endswith('.pptx'):
+                        file_extension = '.pptx'
+                    
+                    # 对于file类型，需要先去掉扩展名再处理文件名
+                    doc_title_base = doc_title[:-len(file_extension)] if file_extension else doc_title
+                    doc_title_safe = "".join(c for c in doc_title_base if c.isalnum() or c in [' ', '.', '_', '-']).strip()
+                    if not doc_title_safe:
+                        doc_title_safe = f"doc_{request.file_token}"
+                        
+                    # 添加回文件扩展名
+                    if file_extension:
+                        doc_title_safe = f"{doc_title_safe}{file_extension}"
+                    
+                    temp_file_path = temp_dir / doc_title_safe
+                    
+                    # 记录文件处理开始
+                    logger.info(f"[文件处理] 开始处理文件: file_token={request.file_token}, 标题={doc_title}, 类型={file_extension}")
+                    
+                    # 下载文件
+                    logger.info(f"[文件处理] 开始下载文件: file_token={request.file_token}, 目标路径={temp_file_path}")
+                    download_result = await feishu_service.download_file(
+                        request.app_id,
+                        request.file_token,
+                        str(temp_file_path)
+                    )
+                    
+                    if download_result.get("code") != 0:
+                        logger.error(f"[文件处理] 下载文件失败: file_token={request.file_token}, 错误={download_result.get('msg')}")
+                        await fastgpt_service.close()
+                        
+                        # 根据错误类型返回不同的信息
+                        error_msg = download_result.get('msg', '下载失败')
+                        status_code = download_result.get('status_code')
+                        
+                        if status_code == 404 or "文件不存在或已被删除" in error_msg:
+                            return {
+                                "code": -1,
+                                "msg": f"文件不存在或已被删除，可能是文件token已过期: {error_msg}",
+                                "data": {
+                                    "file_token": request.file_token,
+                                    "error_type": "file_not_found",
+                                    "recoverable": False
+                                }
+                            }
+                        elif status_code == 403 or "无权限访问" in error_msg:
+                            return {
+                                "code": -1,
+                                "msg": f"无权限访问文件: {error_msg}",
+                                "data": {
+                                    "file_token": request.file_token,
+                                    "error_type": "permission_denied",
+                                    "recoverable": True
+                                }
+                            }
+                        else:
+                            return {
+                                "code": -1,
+                                "msg": f"下载文件失败: {error_msg}",
+                                "data": {
+                                    "file_token": request.file_token,
+                                    "error_type": "download_failed",
+                                    "recoverable": True
+                                }
+                            }
+                    
+                    # 检查文件是否成功下载及文件大小
+                    if temp_file_path.exists():
+                        file_size = temp_file_path.stat().st_size
+                        logger.info(f"[文件处理] 成功下载文件: file_token={request.file_token}, 本地路径={temp_file_path}, 文件大小={file_size}字节")
+                    else:
+                        logger.error(f"[文件处理] 下载后未找到文件: {temp_file_path}")
+                        await fastgpt_service.close()
+                        return {
+                            "code": -1,
+                            "msg": f"下载文件后未找到文件: {temp_file_path}",
+                            "data": None
+                        }
+                    
+                    # 对于这些文件类型，不需要获取内容，直接上传文件
+                    doc_title = doc.title or f"文档-{request.file_token}"
+                elif is_markdown_doc:
+                    # 对于docx、sheet等云文档，获取文档内容
+                    content_result = await feishu_service.get_doc_content(
+                        request.app_id, 
+                        request.file_token, 
+                        request.file_type,
+                        use_filtered_blocks=True  # 默认使用我们自己实现的filtered-blocks处理逻辑
+                    )
+                    
+                    if content_result.get("code") != 0:
+                        logger.error(f"[内容获取] 获取文档内容失败: file_token={request.file_token}, 错误={content_result.get('msg')}")
+                        await fastgpt_service.close()
+                        return {
+                            "code": -1,
+                            "msg": f"获取文档内容失败: {content_result.get('msg', '未知错误')}",
+                            "data": None
+                        }
+                    
+                    # 提取文档内容
+                    document_content = content_result.get("data", {}).get("content", "")
+                    content_method = content_result.get("data", {}).get("method", "unknown")
+                    
+                    logger.info(f"[内容获取] 成功获取{request.file_type}文档内容: file_token={request.file_token}, 方法={content_method}, 内容长度={len(document_content)}")
+                    
+                    doc_title = doc.title or f"文档-{request.file_token}"
+                    
+                    # 检查是否是占位文件：如果markdown内容只有一行并且是#开头，说明是空的占位文件 如果是获取所有块模式则直接是空
+                    if not document_content or (document_content.strip().startswith("#") and len(document_content.strip().split("\n")) == 1):
+                        logger.info(f"检测到占位文件，跳过同步到FastGPT: 文档标题='{doc_title}', 内容='{document_content.strip()}'")
+                        
+                        # 标记为已同步，但不实际同步到FastGPT
+                        success = await feishu_service.update_doc_aichat_time(
+                            request.app_id,
+                            request.file_token,
+                            True
+                        )
+                        
+                        await fastgpt_service.close()
+                        
+                        if success:
+                            return {
+                                "code": 0,
+                                "msg": "检测到占位文件，已标记为同步完成",
+                                "data": {
+                                    "file_token": request.file_token,
+                                    "placeholder_file": True,
+                                    "skipped_sync": True,
+                                    "reason": "文档内容与标题相同，判断为占位文件"
+                                }
+                            }
+                        else:
+                            return {
+                                "code": -1,
+                                "msg": "更新占位文件同步状态失败",
+                                "data": None
+                            }
+                    
+                    # 对于云文档和电子表格，需要将内容保存到临时文件
+                    temp_dir = Path("temp")
+                    temp_dir.mkdir(exist_ok=True)
+                    
+                    # 使用文档标题创建临时文件名，确保文件名有效
+                    doc_title_safe = "".join(c for c in doc_title if c.isalnum() or c in [' ', '.', '_', '-']).strip()
+                    if not doc_title_safe:
+                        doc_title_safe = f"doc_{request.file_token}"
+                    
+                    temp_file_path = temp_dir / f"{doc_title_safe}.md"
+                    
+                    # 写入文档内容到临时文件
+                    try:
+                        with open(temp_file_path, "w", encoding="utf-8") as f:
+                            f.write(document_content)
+                        logger.info(f"成功将{request.file_type}文档内容保存到临时文件: {temp_file_path}")
+                    except Exception as e:
+                        logger.error(f"保存{request.file_type}文档内容到临时文件失败: {str(e)}")
+                        raise
+                else:
+                    logger.error(f"文档类型不支持: {request.file_type}")
+                    await fastgpt_service.close()
+                    return {
+                        "code": -1,
+                        "msg": f"文档类型不支持: {request.file_type}",
+                        "data": None
+                    }
+            except Exception as e:
+                logger.error(f"获取文档内容时发生异常: {str(e)}")
+                await fastgpt_service.close()
+                return {
+                    "code": -1,
+                    "msg": "获取文档内容失败",
+                    "data": None
+                }
+            
+            # 使用app_name作为根文件夹名称
+            root_folder_name = app_config.app_name or f"飞书文档-{request.app_id}"
+            
+            # 查询根目录下是否有app_name同名文件夹
+            list_result = await fastgpt_service.get_dataset_list()
+            
+            root_folder_id = None
+            if list_result.get("code") == 200:
+                # 查找同名文件夹
+                items = list_result.get("data", [])
+                for item in items:
+                    if item.get("name") == root_folder_name and item.get("type") == "folder":
+                        root_folder_id = item.get("_id")
+                        logger.info(f"找到已存在的根文件夹: {root_folder_name}, ID: {root_folder_id}")
+                        break
+            
+            # 如果没有找到同名文件夹，则创建
+            if not root_folder_id:
+                create_result = await fastgpt_service.create_folder(root_folder_name)
+                if create_result.get("code") == 200:
+                    root_folder_id = create_result.get("data")
+                    logger.info(f"成功创建根文件夹: {root_folder_name}, ID: {root_folder_id}")
+                else:
+                    logger.error(f"创建根文件夹失败: {root_folder_name}, 错误: {create_result.get('message')}")
+                    await fastgpt_service.close()
+                    return {
+                        "code": -1,
+                        "msg": f"创建FastGPT根文件夹失败: {create_result.get('message', '未知错误')}",
+                        "data": None
+                    }
+            
+            # 获取知识空间信息
+            wiki_space_name = "未知知识空间"
+            if doc.space_id:
+                logger.info(f"尝试获取知识空间信息，space_id: {doc.space_id}")
+                space_info = await feishu_service.get_wiki_space(request.app_id, doc.space_id)
+                logger.info(f"获取知识空间信息结果: code={space_info.get('code')}, data={space_info.get('data', {})}")
+                
+                if space_info.get("code") == 0 and space_info.get("data"):
+                    # 飞书API返回的数据是嵌套的，name字段在space对象中
+                    space_data = space_info.get("data", {})
+                    # 正确获取嵌套字段
+                    space_obj = space_data.get("space", {})
+                    wiki_space_name = space_obj.get("name", "未知知识空间")
+                    logger.info(f"成功获取知识空间名称: {wiki_space_name}")
+                else:
+                    logger.error(f"获取知识空间信息失败: {space_info.get('msg', '未知错误')}")
+            else:
+                logger.warning(f"文档 {doc.file_token} 没有关联的space_id，无法获取知识空间名称")
+            
+            # 在根文件夹下创建知识空间对应的文件夹
+            wiki_folder_id = None
+            wiki_folder_name = f"{wiki_space_name} - 飞书知识库"
+            
+            # 查询在根文件夹下是否已有知识空间文件夹
+            wiki_folders_result = await fastgpt_service.get_dataset_list(parent_id=root_folder_id)
+            
+            if wiki_folders_result.get("code") == 200:
+                # 查找同名知识空间文件夹
+                items = wiki_folders_result.get("data", [])
+                for item in items:
+                    if item.get("name") == wiki_folder_name and item.get("type") == "folder":
+                        wiki_folder_id = item.get("_id")
+                        logger.info(f"找到已存在的知识空间文件夹: {wiki_folder_name}, ID: {wiki_folder_id}")
+                        break
+            
+            # 如果没有找到知识空间文件夹，则创建
+            if not wiki_folder_id:
+                create_result = await fastgpt_service.create_folder(wiki_folder_name, parent_id=root_folder_id)
+                if create_result.get("code") == 200:
+                    wiki_folder_id = create_result.get("data")
+                    logger.info(f"成功创建知识空间文件夹: {wiki_folder_name}, ID: {wiki_folder_id}")
+                else:
+                    logger.error(f"创建知识空间文件夹失败: {wiki_folder_name}, 错误: {create_result.get('message')}")
+                    # 不中断流程，仍使用根文件夹
+                    wiki_folder_id = root_folder_id
+            
+            # 获取文档的层级路径，如果有的话
+            hierarchy_path = doc.hierarchy_path
+            
+            # 记录在日志中
+            if hierarchy_path:
+                logger.info(f"文档层级路径: {hierarchy_path}")
+            
+            # 记录当前文档处理类型
+            logger.info(f"文档处理类型: direct_file_upload={is_direct_file_upload}, markdown_doc={is_markdown_doc}")
+            
+            logger.info(f"已创建完整目录结构:")
+            logger.info(f"根文件夹: {root_folder_name} (ID: {root_folder_id})")
+            logger.info(f"知识空间文件夹: {wiki_folder_name} (ID: {wiki_folder_id})")
+            
+            # 尝试将文档添加到目标位置
+            try:
+                # 处理所有文档 - 根据hierarchy_path的一级目录创建知识库
+                if hierarchy_path:
+                    # 检查是否是一级目录（不包含分隔符）
+                    is_first_level = "###" not in hierarchy_path
+                    
+                    # 获取一级目录名称
+                    first_level_name = hierarchy_path if is_first_level else hierarchy_path.split("###")[0]
+                    logger.info(f"文档 '{doc_title}' 层级路径: {hierarchy_path}, {'一级目录' if is_first_level else '多级目录'}，一级目录名: {first_level_name}")
+                    
+                    # 确保一级目录名不为空
+                    if first_level_name and first_level_name.strip():
+                        # 创建知识库名称
+                        first_level_dataset_name = f"{first_level_name} - 知识库"
+                        first_level_dataset_id = None
+                        
+                        # 查询在知识空间文件夹下是否已有该一级目录对应的知识库
+                        datasets_result = await fastgpt_service.get_dataset_list(parent_id=wiki_folder_id)
+                        
+                        if datasets_result.get("code") == 200:
+                            items = datasets_result.get("data", [])
+                            for item in items:
+                                if item.get("name") == first_level_dataset_name and item.get("type") == "dataset":
+                                    first_level_dataset_id = item.get("_id")
+                                    logger.info(f"找到已存在的一级目录知识库: {first_level_dataset_name}, ID: {first_level_dataset_id}")
+                                    break
+                        
+                        # 如果没有找到，则创建知识库
+                        if not first_level_dataset_id:
+                            create_result = await fastgpt_service.create_dataset(
+                                name=first_level_dataset_name,
+                                intro=f"{first_level_dataset_name}",
+                                parent_id=wiki_folder_id
+                            )
+                            
+                            if create_result.get("code") == 200:
+                                first_level_dataset_id = create_result.get("data")
+                                logger.info(f"成功创建一级目录知识库: {first_level_dataset_name}, ID: {first_level_dataset_id}")
+                            else:
+                                logger.error(f"创建一级目录知识库失败: {first_level_dataset_name}, 错误: {create_result.get('message')}")
+                        
+                        # 如果成功获取或创建知识库ID，上传文档
+                        if first_level_dataset_id and temp_file_path:
+                            if is_direct_file_upload:
+                                # 文件处理 - 直接上传原始文件
+                                logger.info(f"[文件处理] 准备上传{temp_file_path.suffix}文件到一级目录知识库: dataset_id={first_level_dataset_id}, file_path={temp_file_path}, 文件大小={temp_file_path.stat().st_size}字节")
+                                try:
+                                    upload_result = await fastgpt_service.upload_file_to_dataset(
+                                        dataset_id=first_level_dataset_id,
+                                        file_path=str(temp_file_path)
+                                    )
+                                    logger.info(f"[文件处理] FastGPT上传响应: {upload_result}")
+                                except Exception as e:
+                                    logger.error(f"[文件处理] 上传{temp_file_path.suffix}文件到FastGPT时发生异常: {str(e)}")
+                                    raise
+                            else:
+                                # Markdown文件的处理
+                                upload_result = await fastgpt_service.upload_file_to_dataset(
+                                    dataset_id=first_level_dataset_id,
+                                    file_path=str(temp_file_path)
+                                )
+                            
+                            if upload_result.get("code") == 200:
+                                collection_id = upload_result.get("data", {}).get("collectionId")
+                                if collection_id:
+                                    # 更新数据库中的FastGPT知识库ID
+                                    await feishu_service.db.execute(
+                                        update(DocSubscription)
+                                        .where(
+                                            DocSubscription.app_id == request.app_id,
+                                            DocSubscription.file_token == request.file_token
+                                        )
+                                        .values(collection_id=collection_id)
+                                    )
+                                    await feishu_service.db.commit()
+                                    logger.info(f"成功更新文档的FastGPT知识库ID: {collection_id}")
+                                
+                                logger.info(f"成功上传文档到一级目录知识库: {doc_title}, collection_id: {collection_id}")
+                            else:
+                                logger.error(f"上传文档到一级目录知识库失败: {doc_title}, 错误: {upload_result.get('message')}")
+                        else:
+                            logger.error(f"无法上传文档：未成功创建或获取一级目录知识库ID")
+                    else:
+                        logger.error(f"文档一级目录名称为空，无法处理: {hierarchy_path}")
+                else:
+                    logger.info(f"文档 '{doc_title}' 没有层级路径信息，无法确定归属的一级目录")
+            except Exception as e:
+                logger.error(f"添加文档时发生异常: {str(e)}")
+
+            # 清理临时文件
+            if temp_file_path and temp_file_path.exists():
+                try:
+                    import os
+                    os.remove(temp_file_path)
+                    logger.info(f"已清理临时文件: {temp_file_path}")
+                except Exception as e:
+                    logger.warning(f"清理临时文件失败: {str(e)}")
+            
+            
+            # 更新文档同步时间
+            success = await feishu_service.update_doc_aichat_time(
+                request.app_id,
+                request.file_token,
+                True
+            )
+            
+            if not success:
+                await fastgpt_service.close()
+                return {
+                    "code": -1,
+                    "msg": "更新AI知识库同步时间失败",
+                    "data": None
+                }
+                
+            # 关闭FastGPT服务
+            await fastgpt_service.close()
+            
+            return {
+                "code": 0,
+                "msg": "成功处理文档同步请求",
+                "data": {
+                    "file_token": request.file_token,
+                    "root_folder_id": root_folder_id,
+                    "root_folder_name": root_folder_name,
+                    "wiki_folder_id": wiki_folder_id,
+                    "wiki_folder_name": wiki_folder_name,
+                    "hierarchy_path": hierarchy_path,
+                    "file_type": request.file_type
+                }
+            }
+        except Exception as e:
+            logger.error(f"同步文档到AI知识库时发生错误: {str(e)}")
+            # 确保关闭FastGPT服务
+            await fastgpt_service.close()
+            raise
+    except Exception as e:
+        return {
+            "code": -1,
+            "msg": f"同步文档到AI知识库时发生错误: {str(e)}",
+            "data": None
+        } 
+
+# 批量重置docx文件的AI知识库更新时间
+@router.post("/reset-docx-aichat-time", response_model=SubscribeResponse)
+async def reset_docx_aichat_update_time(
+    app_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """重置docx文档的aichat_update_time为None，使其能够被重新同步
+    
+    仅影响docx类型的文档，用于强制重新同步所有docx文档
+    """
+    try:
+        # 更新数据库中docx类型文档的aichat_update_time为None
+        await db.execute(
+            update(DocSubscription)
+            .where(
+                DocSubscription.app_id == app_id,
+                DocSubscription.file_type == "docx"
+            )
+            .values(aichat_update_time=None)
+        )
+        await db.commit()
+        
+        # 查询受影响的文档数量
+        count_query = await db.execute(
+            select(func.count())
+            .select_from(DocSubscription)
+            .where(
+                DocSubscription.app_id == app_id,
+                DocSubscription.file_type == "docx",
+                DocSubscription.status == 1
+            )
+        )
+        affected_count = count_query.scalar_one() or 0
+        
+        logger.info(f"成功重置docx文档AI知识库更新时间: app_id={app_id}, 影响文档数={affected_count}")
+        
+        return {
+            "code": 0,
+            "msg": f"成功重置{affected_count}个docx文档的AI知识库更新时间",
+            "data": {"affected_count": affected_count}
+        }
+        
+    except Exception as e:
+        logger.error(f"重置docx文档AI知识库更新时间失败: app_id={app_id}, error={str(e)}")
+        return {
+            "code": -1,
+            "msg": f"重置失败: {str(e)}"
+        }
+
+# 测试sheet文档处理
+@router.post("/test-sheet", response_model=SubscribeResponse)
+async def test_sheet_processing(
+    request: TestSheetRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """测试飞书电子表格文档处理功能
+    
+    这个接口可以用来测试sheet类型文档的处理流程：
+    1. 获取电子表格的所有工作表列表
+    2. 读取每个工作表的内容
+    3. 转换为Markdown格式
+    
+    Args:
+        request: 包含app_id和sheet_token的请求
+        
+    Returns:
+        处理后的Markdown内容和详细的处理信息
+    """
+    try:
+        logger.info(f"开始测试sheet文档处理: app_id={request.app_id}, sheet_token={request.sheet_token}")
+        
+        # 1. 获取工作表列表
+        sheets_result = await feishu_service.get_spreadsheet_sheets(request.app_id, request.sheet_token)
+        if sheets_result.get("code") != 0:
+            return {
+                "code": sheets_result.get("code", -1),
+                "msg": f"获取工作表列表失败: {sheets_result.get('msg')}",
+                "data": None
+            }
+        
+        sheets = sheets_result.get("data", {}).get("sheets", [])
+        logger.info(f"成功获取工作表列表: 共{len(sheets)}个工作表")
+        
+        # 2. 获取完整文档内容（使用已有的方法）
+        content_result = await feishu_service.get_sheet_doc_content(request.app_id, request.sheet_token)
+        
+        if content_result.get("code") != 0:
+            return {
+                "code": content_result.get("code", -1),
+                "msg": f"获取文档内容失败: {content_result.get('msg')}",
+                "data": None
+            }
+        
+        # 3. 准备详细的响应数据
+        markdown_content = content_result.get("data", {}).get("content", "")
+        
+        # 获取每个工作表的基本信息
+        sheets_info = []
+        for sheet in sheets:
+            sheet_info = {
+                "sheet_id": sheet.get("sheet_id"),
+                "title": sheet.get("title"),
+                "index": sheet.get("index"),
+                "hidden": sheet.get("hidden", False),
+                "grid_properties": sheet.get("grid_properties", {})
+            }
+            sheets_info.append(sheet_info)
+        
+        logger.info(f"成功处理sheet文档: sheet_token={request.sheet_token}, 内容长度={len(markdown_content)}")
+        
+        return {
+            "code": 0,
+            "msg": "成功处理电子表格文档",
+            "data": {
+                "sheet_token": request.sheet_token,
+                "total_sheets": len(sheets),
+                "sheets_info": sheets_info,
+                "markdown_content": markdown_content,
+                "content_length": len(markdown_content),
+                "method": "sheet-api"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"测试sheet文档处理异常: app_id={request.app_id}, sheet_token={request.sheet_token}, error={str(e)}")
+        return {
+            "code": -1,
+            "msg": f"处理异常: {str(e)}",
+            "data": None
+        }
+
+# 获取电子表格工作表列表
+@router.get("/{app_id}/sheet/{sheet_token}/sheets", response_model=SubscribeResponse)
+async def get_sheet_list(
+    app_id: str,
+    sheet_token: str,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取电子表格的工作表列表
+    
+    Args:
+        app_id: 应用ID
+        sheet_token: 电子表格Token
+        
+    Returns:
+        工作表列表信息
+    """
+    result = await feishu_service.get_spreadsheet_sheets(app_id, sheet_token)
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    }
+
+# 获取单个工作表内容
+@router.get("/{app_id}/sheet/{sheet_token}/{sheet_id}", response_model=SubscribeResponse)
+async def get_sheet_content(
+    app_id: str,
+    sheet_token: str,
+    sheet_id: str,
+    range_str: str = Query(None, description="读取范围，如A1:Z100，为空则读取整个工作表"),
+    value_render_option: str = Query("ToString", description="单元格数据格式：ToString、Formula、FormattedValue、UnformattedValue"),
+    date_time_render_option: str = Query("FormattedString", description="日期时间格式：FormattedString"),
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """获取单个工作表的内容
+    
+    Args:
+        app_id: 应用ID
+        sheet_token: 电子表格Token
+        sheet_id: 工作表ID
+        range_str: 读取范围（可选）
+        value_render_option: 单元格数据格式
+        date_time_render_option: 日期时间格式
+        
+    Returns:
+        工作表内容数据
+    """
+    result = await feishu_service.get_sheet_content(
+        app_id, 
+        sheet_token, 
+        sheet_id, 
+        range_str,
+        value_render_option,
+        date_time_render_option
+    )
+    
+    return {
+        "code": result.get("code", -1),
+        "msg": result.get("msg", ""),
+        "data": result.get("data")
+    } 

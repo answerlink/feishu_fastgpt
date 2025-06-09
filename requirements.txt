@@ -1,0 +1,17 @@
+fastapi>=0.100.0
+uvicorn>=0.15.0
+sqlalchemy>=1.4.23
+aiomysql>=0.1.1
+pymysql>=1.0.2
+pydantic>=2.5.2
+pydantic-settings==2.1.0
+python-dotenv>=0.21.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.5
+apscheduler==3.10.4
+httpx==0.25.2
+aiohttp>=3.8.1
+lark-oapi>=1.0.0 
+aiofiles==24.1.0
+beautifulsoup4==4.13.4

@@ -1,0 +1,273 @@
+<template>
+  <div class="log-viewer">
+    <el-card>
+      <template #header>
+        <div class="card-header">
+          <span>系统日志查看器</span>
+          <div class="header-controls">
+            <el-select
+              v-model="selectedLogType"
+              placeholder="选择日志类型"
+              style="width: 200px; margin-right: 10px;"
+            >
+              <el-option label="订阅定时任务日志" value="subscription_scheduler" />
+              <el-option label="飞书服务日志" value="feishu_service" />
+              <el-option label="飞书回调日志" value="feishu_callback" />
+              <el-option label="主应用日志" value="feishu-plus" />
+            </el-select>
+            <el-button
+              type="primary"
+              :icon="Refresh"
+              :loading="loading"
+              @click="refreshLogs"
+            >
+              刷新
+            </el-button>
+          </div>
+        </div>
+      </template>
+
+      <div class="log-content" v-loading="loading">
+        <div v-if="logs.length > 0" class="log-container">
+          <pre v-for="(log, index) in logs" :key="index" :class="getLogClass(log)">{{ log }}</pre>
+        </div>
+        <div v-else class="no-logs">
+          <el-empty description="暂无日志记录" />
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="log-footer">
+          <el-pagination
+            v-if="logs.length > 0"
+            :current-page="currentPage"
+            :page-size="pageSize"
+            :total="totalLogs"
+            layout="total, prev, pager, next"
+            @current-change="handlePageChange"
+          />
+          <div class="log-actions">
+            <el-button size="small" @click="downloadLogs">下载日志</el-button>
+            <el-button size="small" type="danger" @click="clearLogs">清空日志</el-button>
+          </div>
+        </div>
+      </template>
+    </el-card>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Refresh } from '@element-plus/icons-vue'
+import axios from 'axios'
+
+const selectedLogType = ref('subscription_scheduler')
+const logs = ref([])
+const loading = ref(false)
+const currentPage = ref(1)
+const pageSize = ref(100)
+const totalLogs = ref(0)
+
+// 监听日志类型变化
+watch(selectedLogType, () => {
+  currentPage.value = 1
+  fetchLogs()
+})
+
+// 获取日志
+const fetchLogs = async () => {
+  loading.value = true
+  try {
+    const response = await axios.get('/api/v1/logs/view', {
+      params: {
+        type: selectedLogType.value,
+        page: currentPage.value,
+        page_size: pageSize.value
+      }
+    })
+    
+    logs.value = response.data.logs
+    totalLogs.value = response.data.total
+    
+    if (logs.value.length === 0 && totalLogs.value > 0) {
+      ElMessage.info('当前页没有日志记录')
+    }
+  } catch (error) {
+    console.error('获取日志失败:', error)
+    ElMessage.error('获取日志失败: ' + (error.response?.data?.detail || error.message))
+    logs.value = []
+    totalLogs.value = 0
+  } finally {
+    loading.value = false
+  }
+}
+
+// 刷新日志
+const refreshLogs = () => {
+  fetchLogs()
+}
+
+// 处理分页变化
+const handlePageChange = (page) => {
+  currentPage.value = page
+  fetchLogs()
+}
+
+// 下载日志
+const downloadLogs = async () => {
+  try {
+    loading.value = true
+    const response = await axios.get('/api/v1/logs/download', {
+      params: {
+        type: selectedLogType.value
+      },
+      responseType: 'blob'
+    })
+    
+    // 创建下载链接
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', `${selectedLogType.value}_${new Date().toISOString().split('T')[0]}.log`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    
+    ElMessage.success('日志下载成功')
+  } catch (error) {
+    console.error('下载日志失败:', error)
+    ElMessage.error('下载日志失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+// 清空日志
+const clearLogs = async () => {
+  try {
+    await ElMessageBox.confirm(
+      `确定要清空${getLogTypeName(selectedLogType.value)}吗？此操作不可恢复`,
+      '警告',
+      {
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+    
+    loading.value = true
+    await axios.post('/api/v1/logs/clear', {
+      type: selectedLogType.value
+    })
+    
+    ElMessage.success('日志已清空')
+    fetchLogs()
+  } catch (error) {
+    if (error !== 'cancel') {
+      console.error('清空日志失败:', error)
+      ElMessage.error('清空日志失败: ' + (error.response?.data?.detail || error.message))
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+// 获取日志类型名称
+const getLogTypeName = (type) => {
+  const typeMap = {
+    'subscription_scheduler': '订阅定时任务日志',
+    'feishu_service': '飞书服务日志',
+    'feishu_callback': '飞书回调日志',
+    'feishu-plus': '主应用日志'
+  }
+  return typeMap[type] || type
+}
+
+// 根据日志内容设置样式
+const getLogClass = (log) => {
+  if (log.includes('[ERROR]') || log.includes('error')) {
+    return 'log-line error'
+  } else if (log.includes('[WARNING]') || log.includes('warning')) {
+    return 'log-line warning'
+  } else if (log.includes('[INFO]') || log.includes('info')) {
+    return 'log-line info'
+  } else {
+    return 'log-line'
+  }
+}
+
+onMounted(() => {
+  fetchLogs()
+})
+</script>
+
+<style scoped>
+.log-viewer {
+  padding: 20px;
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+}
+
+.log-content {
+  min-height: 500px;
+  max-height: 600px;
+  overflow-y: auto;
+  background-color: #1e1e1e;
+  border-radius: 4px;
+  padding: 10px;
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+}
+
+.log-container {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-line {
+  margin: 0;
+  padding: 2px 0;
+  color: #d4d4d4;
+}
+
+.log-line.error {
+  color: #ff6b6b;
+}
+
+.log-line.warning {
+  color: #ffd166;
+}
+
+.log-line.info {
+  color: #06d6a0;
+}
+
+.no-logs {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 300px;
+}
+
+.log-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.log-actions {
+  display: flex;
+  gap: 10px;
+}
+</style> 
