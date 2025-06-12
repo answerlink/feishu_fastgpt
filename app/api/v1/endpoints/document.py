@@ -211,6 +211,27 @@ async def get_documents_for_aichat_sync(
     
     如果指定file_token，则只返回该文档的信息，不考虑上述条件
     """
+    # 检查指定应用是否启用了dataset_sync
+    app_config = next((app for app in settings.FEISHU_APPS if app.app_id == app_id), None)
+    
+    if not app_config:
+        return {
+            "code": -1,
+            "msg": f"找不到应用配置: {app_id}",
+            "data": None
+        }
+    
+    if not app_config.dataset_sync:
+        return {
+            "code": 0,
+            "msg": f"应用 {app_id} 的dataset_sync功能已禁用",
+            "data": {
+                "total": 0,
+                "items": [],
+                "dataset_sync_disabled": True
+            }
+        }
+    
     result = await feishu_service.get_docs_for_aichat_sync(app_id, limit, file_token)
     
     return {
@@ -239,6 +260,26 @@ async def manual_sync_to_aichat(
     5. 同步文档内容到知识库
     6. 更新文档同步时间
     """
+    # 检查指定应用是否启用了dataset_sync
+    app_config = next((app for app in settings.FEISHU_APPS if app.app_id == request.app_id), None)
+    
+    if not app_config:
+        return {
+            "code": -1,
+            "msg": f"找不到应用配置: {request.app_id}",
+            "data": None
+        }
+    
+    if not app_config.dataset_sync:
+        return {
+            "code": 0,
+            "msg": f"应用 {request.app_id} 的dataset_sync功能已禁用，跳过同步",
+            "data": {
+                "file_token": request.file_token,
+                "dataset_sync_disabled": True
+            }
+        }
+    
     # 直接调用同步函数
     result = await sync_document_to_aichat(request, feishu_service)
     
@@ -603,6 +644,17 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                 "data": None
             }
         
+        # 检查是否启用了dataset_sync
+        if not app_config.dataset_sync:
+            return {
+                "code": 0,
+                "msg": f"应用 {request.app_id} 的dataset_sync功能已禁用，跳过同步",
+                "data": {
+                    "file_token": request.file_token,
+                    "dataset_sync_disabled": True
+                }
+            }
+        
         # 初始化FastGPT服务
         from app.services.fastgpt_service import FastGPTService
         fastgpt_service = FastGPTService(request.app_id)
@@ -665,8 +717,8 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
             # 如果目录发生变化，先删除旧的知识文件记录
             if doc.collection_id:
                 try:
-                    delete_result = await fastgpt_service.delete_document_from_dataset(doc.collection_id)
-                    if delete_result.get("code") == 0:  # 修改判断条件
+                    delete_result = await fastgpt_service.delete_collection(doc.collection_id)
+                    if delete_result.get("code") == 200:  # 修改判断条件
                         logger.info(f"成功删除旧的知识库记录: collection_id={doc.collection_id}")
                     else:
                         logger.error(f"删除旧的知识库记录失败: {delete_result.get('msg')}")
@@ -1003,6 +1055,31 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                         
                         # 如果成功获取或创建知识库ID，上传文档
                         if first_level_dataset_id and temp_file_path:
+                            # 在上传之前，先按文件名删除可能存在的重复文档
+                            doc_title_for_dedup = doc.title or f"文档-{request.file_token}"
+                            
+                            logger.info(f"[文件去重] 开始检查重复文档: filename={doc_title_for_dedup}, dataset_id={first_level_dataset_id}")
+                            
+                            try:
+                                # 按文件名删除重复的文档
+                                dedup_result = await fastgpt_service.delete_collections_by_name(
+                                    dataset_id=first_level_dataset_id,
+                                    filename=doc_title_for_dedup,  # 直接使用完整文件名（包含扩展名）
+                                    parent_id=None
+                                )
+                                
+                                if dedup_result.get("code") == 0:
+                                    deleted_count = dedup_result.get("deleted_count", 0)
+                                    if deleted_count > 0:
+                                        logger.info(f"[文件去重] 成功删除 {deleted_count} 个重复文档: {doc_title_for_dedup}")
+                                    else:
+                                        logger.info(f"[文件去重] 未发现重复文档: {doc_title_for_dedup}")
+                                else:
+                                    logger.warning(f"[文件去重] 去重检查失败: {dedup_result.get('msg')}")
+                            except Exception as e:
+                                logger.error(f"[文件去重] 执行去重时发生异常: {str(e)}")
+                                # 去重失败不影响后续上传流程，继续执行
+                            
                             if is_direct_file_upload:
                                 # 文件处理 - 直接上传原始文件
                                 logger.info(f"[文件处理] 准备上传{temp_file_path.suffix}文件到一级目录知识库: dataset_id={first_level_dataset_id}, file_path={temp_file_path}, 文件大小={temp_file_path.stat().st_size}字节")
@@ -1017,9 +1094,14 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                                     raise
                             else:
                                 # Markdown文件的处理
+                                # 为sheet类型文档设置更大的chunk_size
+                                chunk_size = 5120 if request.file_type == "sheet" else 512
+                                logger.info(f"[Markdown处理] 文档类型: {request.file_type}, chunk_size: {chunk_size}")
+                                
                                 upload_result = await fastgpt_service.upload_file_to_dataset(
                                     dataset_id=first_level_dataset_id,
-                                    file_path=str(temp_file_path)
+                                    file_path=str(temp_file_path),
+                                    chunk_size=chunk_size
                                 )
                             
                             if upload_result.get("code") == 200:
@@ -1036,6 +1118,17 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                                     )
                                     await feishu_service.db.commit()
                                     logger.info(f"成功更新文档的FastGPT知识库ID: {collection_id}")
+                                
+                                # 生成并更新dataset描述
+                                try:
+                                    if first_level_dataset_id:
+                                        desc_result = await fastgpt_service.generate_and_update_dataset_description(first_level_dataset_id)
+                                        if desc_result.get("code") == 200:
+                                            logger.info(f"成功生成并更新dataset描述: dataset_id={first_level_dataset_id}, description={desc_result.get('data', {}).get('description', '')}")
+                                        else:
+                                            logger.info(f"生成dataset描述结果: {desc_result.get('message', '未知')}")
+                                except Exception as e:
+                                    logger.warning(f"生成dataset描述时发生异常，但不影响主流程: {str(e)}")
                                 
                                 logger.info(f"成功上传文档到一级目录知识库: {doc_title}, collection_id: {collection_id}")
                             else:
@@ -1294,4 +1387,66 @@ async def get_sheet_content(
         "code": result.get("code", -1),
         "msg": result.get("msg", ""),
         "data": result.get("data")
-    } 
+    }
+
+# 手动生成dataset描述
+@router.post("/generate-dataset-description", response_model=SubscribeResponse)
+async def generate_dataset_description(
+    app_id: str,
+    dataset_id: str
+):
+    """手动生成并更新dataset描述
+    
+    根据dataset中的collection列表调用LLM生成描述，并更新到dataset中
+    
+    Args:
+        app_id: 应用ID
+        dataset_id: 知识库ID
+        
+    Returns:
+        dict: 生成结果
+    """
+    try:
+        # 检查指定应用是否启用了dataset_sync
+        app_config = next((app for app in settings.FEISHU_APPS if app.app_id == app_id), None)
+        
+        if not app_config:
+            return {
+                "code": -1,
+                "msg": f"找不到应用配置: {app_id}",
+                "data": None
+            }
+        
+        if not app_config.dataset_sync:
+            return {
+                "code": 0,
+                "msg": f"应用 {app_id} 的dataset_sync功能已禁用，跳过描述生成",
+                "data": {
+                    "dataset_sync_disabled": True
+                }
+            }
+        
+        # 初始化FastGPT服务
+        from app.services.fastgpt_service import FastGPTService
+        fastgpt_service = FastGPTService(app_id)
+        
+        try:
+            # 生成并更新dataset描述
+            result = await fastgpt_service.generate_and_update_dataset_description(dataset_id)
+            
+            return {
+                "code": result.get("code", -1),
+                "msg": result.get("message", ""),
+                "data": result.get("data")
+            }
+        finally:
+            # 确保关闭FastGPT服务
+            await fastgpt_service.close()
+            
+    except Exception as e:
+        logger.error(f"手动生成dataset描述失败: app_id={app_id}, dataset_id={dataset_id}, error={str(e)}")
+        return {
+            "code": -1,
+            "msg": f"生成dataset描述失败: {str(e)}",
+            "data": None
+        } 

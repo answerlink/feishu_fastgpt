@@ -6,14 +6,33 @@ import sys
 import os
 import pymysql
 from app.core.config import settings
-from app.core.logger import setup_logger
+from app.core.logger import setup_logger, setup_app_logger
 from app.models.doc_subscription import DocSubscription
 from sqlalchemy import select, create_engine
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timedelta
 from sqlalchemy import update
 
-logger = setup_logger("feishu_callback")
+# 检查是否在单应用模式
+single_app_mode = os.environ.get('FEISHU_SINGLE_APP_MODE', 'false').lower() == 'true'
+target_app_id = os.environ.get('FEISHU_SINGLE_APP_ID') if single_app_mode else None
+
+# 根据模式选择logger设置方式
+if single_app_mode and target_app_id:
+    # 单应用模式：查找应用配置并使用专用logger
+    target_app = None
+    for app in settings.FEISHU_APPS:
+        if app.app_id == target_app_id:
+            target_app = app
+            break
+    
+    if target_app:
+        logger = setup_app_logger("feishu_callback", target_app.app_id, target_app.app_name)
+    else:
+        logger = setup_logger("feishu_callback")
+else:
+    # 多应用模式：使用全局logger
+    logger = setup_logger("feishu_callback")
 
 class FeishuCallbackService:
     """飞书回调服务 - 单应用模式"""

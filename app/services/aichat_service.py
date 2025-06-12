@@ -22,100 +22,6 @@ class AIChatService:
             self._client = aiohttp.ClientSession()
         return self._client
     
-    async def chat_completion(self, message: str, chat_id: str = None, variables: Dict[str, Any] = None) -> str:
-        """调用AI Chat接口获取回复
-        
-        Args:
-            message: 用户消息
-            variables: 额外变量，默认包含token
-            
-        Returns:
-            str: AI回复内容
-        """
-        try:
-            data = {
-                "chatId": chat_id,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": message
-                    }
-                ],
-                "variables": variables,
-                "stream": True,
-                "detail": True
-            }
-            
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            logger.info(f"调用AI Chat接口: {message[:50]}...")
-            
-            # 发送请求并处理流式响应
-            reply_content = ""
-            # 使用临时的客户端会话避免事件循环冲突
-            async with aiohttp.ClientSession(
-                read_bufsize=1024*1024,  # 1MB缓冲区，解决Chunk too big错误
-                max_line_size=1024*1024,  # 1MB最大行大小
-                max_field_size=1024*1024  # 1MB最大字段大小
-            ) as client:
-                async with client.post(self.api_url, json=data, headers=headers) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"AI Chat接口返回错误: status={response.status}, error={error_text}")
-                        return f"抱歉，AI服务暂时不可用，请稍后再试。"
-                    
-                    # 处理流式响应
-                    async for line in response.content:
-                        line_text = line.decode('utf-8').strip()
-                        
-                        if not line_text:
-                            continue
-                        
-                        # 检查是否是结束标志
-                        if line_text == "data: [DONE]":
-                            logger.info(f"AI Chat响应结束，总内容长度: {len(reply_content)}")
-                            break
-                        
-                        # 解析SSE格式数据
-                        if line_text.startswith("data: "):
-                            try:
-                                data_str = line_text[6:]  # 去掉"data: "前缀
-                                data_obj = json.loads(data_str)
-                                
-                                # 只处理answer事件
-                                if line_text.startswith("data: ") and "choices" in data_obj:
-                                    choices = data_obj.get("choices", [])
-                                    if choices and len(choices) > 0:
-                                        delta = choices[0].get("delta", {})
-                                        content = delta.get("content")
-                                        
-                                        if content:
-                                            reply_content += content
-                                            
-                            except json.JSONDecodeError:
-                                # 忽略非JSON格式的行
-                                continue
-                            except Exception as e:
-                                logger.warning(f"解析SSE数据异常: {str(e)}, line: {line_text[:100]}")
-                                continue
-            
-            # 如果没有获取到内容，返回默认回复
-            if not reply_content.strip():
-                reply_content = "抱歉，我暂时无法理解您的问题，请换个方式提问。"
-            
-            logger.info(f"AI Chat回复成功，内容长度: {len(reply_content)}")
-            return reply_content.strip()
-            
-        except asyncio.TimeoutError:
-            logger.error("AI Chat接口调用超时")
-            return "抱歉，处理时间过长，请稍后再试。"
-        except Exception as e:
-            logger.error(f"调用AI Chat接口异常: {str(e)}")
-            return "抱歉，AI服务遇到问题，请稍后再试。"
-
     async def chat_completion_streaming_enhanced(self, message: str, variables: Dict[str, Any] = None, chat_id: str = None,
                                                on_status_callback=None, on_think_callback=None, on_answer_callback=None,
                                                on_references_callback=None) -> str:
@@ -154,7 +60,6 @@ class AIChatService:
             logger.info(f"调用AI Chat接口（增强流式回调）: {message[:50]}...")
             
             # 发送请求并处理流式响应
-            reply_content = ""
             think_content = ""
             answer_content = ""
             flow_node_statuses = []  # 存储流程节点状态
@@ -195,7 +100,7 @@ class AIChatService:
                         
                         # 检查是否是结束标志
                         if line_text == "data: [DONE]":
-                            logger.info(f"AI Chat响应结束，总内容长度: {len(reply_content)}")
+                            logger.info(f"AI Chat响应结束，总内容长度: {len(answer_content)}")
                             # 调用回调函数标记完成
                             if on_status_callback and flow_node_statuses:
                                 await on_status_callback("✅ **处理完成**")
@@ -287,7 +192,6 @@ class AIChatService:
                                                     pending_think = None
                                                 
                                                 answer_content += content
-                                                reply_content += content
                                                 
                                                 # 频率控制：立即发送或保存待发送
                                                 current_time = time.time()
@@ -302,34 +206,18 @@ class AIChatService:
                                                         # 保存为待发送（覆盖之前的）
                                                         pending_answer = answer_content
                                     else:
-                                        # 其他格式的答案内容
-                                        content = data_obj.get("data", {}).get("content", "") or data_obj.get("content", "")
-                                        if content:
-                                            # 如果获取到答案内容，则发送最终思考内容
-                                            if pending_think and on_think_callback:
-                                                task = asyncio.create_task(on_think_callback(pending_think))
-                                                pending_tasks.append(task)
-                                                logger.debug(f"发送待发送的最终思考内容，长度: {len(pending_think)}")
-                                                pending_think = None
-
-                                            answer_content += content
-                                            reply_content += content
-                                            
-                                            # 频率控制：立即发送或保存待发送
-                                            current_time = time.time()
-                                            if on_answer_callback:
-                                                if (current_time - last_answer_update) >= callback_interval:
-                                                    # 立即发送
-                                                    last_answer_update = current_time
-                                                    task = asyncio.create_task(on_answer_callback(answer_content))
-                                                    pending_tasks.append(task)
-                                                    pending_answer = None  # 清除待发送
-                                                else:
-                                                    # 保存为待发送（覆盖之前的）
-                                                    pending_answer = answer_content
+                                        # 其他格式忽略
+                                        pass
                                 
                                 elif current_event == "flowResponses" and isinstance(data_obj, list):
-                                    # 处理流程响应数据
+                                    # 处理流程响应数据 （代表本次长连接完全结束）
+                                    
+                                    # 检查是否有未完成的答案更新
+                                    if pending_answer and on_answer_callback:
+                                        task = asyncio.create_task(on_answer_callback(pending_answer))
+                                        pending_tasks.append(task)
+                                        pending_answer = None  # 清除待发送
+
                                     all_references = []  # 收集所有引用数据
                                     
                                     for flow_response in data_obj:
@@ -383,12 +271,8 @@ class AIChatService:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
                 logger.info("所有异步任务已完成")
             
-            # 如果没有获取到内容，返回默认回复
-            if not reply_content.strip():
-                reply_content = "抱歉，我暂时无法理解您的问题，请换个方式提问。"
-            
-            logger.info(f"AI流式回复完成，最终内容长度: {len(reply_content)}")
-            return reply_content
+            logger.info(f"AI流式回复完成，最终内容长度: {len(answer_content)}")
+            return answer_content
 
         except asyncio.TimeoutError:
             logger.error("AI Chat接口调用超时")

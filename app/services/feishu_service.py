@@ -355,9 +355,9 @@ class FeishuService:
                                 fastgpt_service = FastGPTService(app_id)
                                 
                                 # 调用删除API
-                                delete_result = await fastgpt_service.delete_document_from_dataset(doc_record.collection_id)
+                                delete_result = await fastgpt_service.delete_collection(doc_record.collection_id)
                                 
-                                if delete_result.get("code") == 0:
+                                if delete_result.get("code") == 200:
                                     logger.info(f"已从FastGPT知识库中删除无效文档: collection_id={doc_record.collection_id}")
                                 else:
                                     logger.error(f"从FastGPT知识库中删除无效文档失败: collection_id={doc_record.collection_id}, error={delete_result.get('msg')}")

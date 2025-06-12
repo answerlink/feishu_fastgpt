@@ -8,6 +8,11 @@ from app.core.deps import get_feishu_service
 router = APIRouter()
 logger = setup_logger("api.test")
 
+@router.get("/ping")
+async def ping():
+    """健康检查接口"""
+    return {"status": "ok", "message": "Service is running"}
+
 @router.get("/token/{app_id}")
 async def test_token(
     app_id: str,

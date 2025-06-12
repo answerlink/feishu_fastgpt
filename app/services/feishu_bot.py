@@ -5,12 +5,32 @@ import asyncio
 import re
 import os
 import tempfile
+import shutil
 from typing import Dict, Any, Optional
 from app.core.config import settings
-from app.core.logger import setup_logger
+from app.core.logger import setup_logger, setup_app_logger
 from app.services.aichat_service import AIChatService
 
-logger = setup_logger("feishu_bot")
+# 检查是否在单应用模式
+single_app_mode = os.environ.get('FEISHU_SINGLE_APP_MODE', 'false').lower() == 'true'
+target_app_id = os.environ.get('FEISHU_SINGLE_APP_ID') if single_app_mode else None
+
+# 根据模式选择logger设置方式
+if single_app_mode and target_app_id:
+    # 单应用模式：查找应用配置并使用专用logger
+    target_app = None
+    for app in settings.FEISHU_APPS:
+        if app.app_id == target_app_id:
+            target_app = app
+            break
+    
+    if target_app:
+        logger = setup_app_logger("feishu_bot", target_app.app_id, target_app.app_name)
+    else:
+        logger = setup_logger("feishu_bot")
+else:
+    # 多应用模式：使用全局logger
+    logger = setup_logger("feishu_bot")
 
 class FeishuBotService:
     """飞书机器人服务"""
@@ -128,10 +148,7 @@ class FeishuBotService:
                     except Exception as e:
                         logger.error(f"流式卡片回复失败，回退到普通文本回复: {str(e)}")
                         # 继续执行普通文本回复
-                
-                # 普通文本回复（回退方案）
-                reply_text = await self.generate_reply(text_content, sender_id)
-                await self.send_text_message(receive_id, reply_text, receive_id_type=receive_id_type)
+                        self._get_default_reply(text_content)
                 
             return True
             
@@ -147,7 +164,8 @@ class FeishuBotService:
             # 获取配置
             read_collection_url = getattr(self.app_config, 'aichat_read_collection_url', None)
             read_collection_key = getattr(self.app_config, 'aichat_read_collection_key', None)
-            
+            client_download_host = getattr(self.app_config, 'aichat_client_download_host', None)
+
             if not read_collection_url or not read_collection_key:
                 logger.warning("AI Chat读取集合配置不完整，无法获取下载链接")
                 return None
@@ -171,13 +189,8 @@ class FeishuBotService:
                         file_value = data.get("value", "")
                         
                         if file_value and file_value.startswith("/"):
-                            # 从read_collection_url中提取host部分
-                            from urllib.parse import urlparse
-                            parsed_url = urlparse(read_collection_url)
-                            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                            
                             # 拼接完整的下载链接
-                            download_url = base_url + file_value
+                            download_url = client_download_host.rstrip('/') + file_value
                             # logger.debug(f"获取到collection下载链接: {download_url}")
                             return download_url
                         else:
@@ -249,41 +262,6 @@ class FeishuBotService:
                 "success": False
             }
 
-    async def generate_reply(self, user_message: str, user_id: str) -> str:
-        """生成回复内容"""
-        try:
-            # 如果启用了AI Chat服务，优先使用AI回复
-            if self.aichat_service:
-                logger.info(f"使用AI Chat服务生成回复: user_id {user_id}, {user_message[:50]}...")
-                
-                # 获取用户详细信息
-                user_info = await self.get_user_info(user_id)
-                
-                # 调用AI Chat接口
-                ai_reply = await self.aichat_service.chat_completion(
-                    chat_id="feishu_user_" + user_id,
-                    message=user_message,
-                    variables={
-                        "feishu_user_id": user_info["user_id"],
-                        "feishu_mobile": user_info["mobile"],
-                        "feishu_name": user_info["name"]
-                    }
-                )
-                
-                if ai_reply and ai_reply.strip():
-                    logger.info(f"AI回复成功，长度: {len(ai_reply)}")
-                    return ai_reply
-                else:
-                    logger.warning("AI回复为空，使用默认回复")
-            
-            # 如果AI服务不可用或返回空内容，使用默认的关键词回复
-            return self._get_default_reply(user_message)
-            
-        except Exception as e:
-            logger.error(f"生成回复异常: {str(e)}")
-            # 出现异常时返回默认回复
-            return self._get_default_reply(user_message)
-
     async def generate_streaming_reply(self, user_message: str, user_id: str, receive_id: str, 
                                      receive_id_type: str = "user_id") -> str:
         """生成流式回复内容（使用卡片流式更新）"""
@@ -295,6 +273,9 @@ class FeishuBotService:
                 # 获取用户详细信息
                 user_info = await self.get_user_info(user_id)
                 
+                # 构建包含app_name的chat_id
+                app_name = getattr(self.app_config, 'app_name', 'default') if self.app_config else 'default'
+                
                 # 初始化当前卡片内容状态
                 current_card_state = {
                     "user_message": user_message,
@@ -302,9 +283,11 @@ class FeishuBotService:
                     "status": "🔄 **正在准备**...",
                     "think_title": "💭 **准备思考中...**",
                     "think_content": "",
+                    "think_finished": False,
                     "answer_content": "",
                     "references_title": "📚 **知识库引用** (0)",
                     "references_content": "",
+                    "bot_summary": "AI正在思考中...",  # 机器人问答状态
                     "image_cache": {},  # 添加图片缓存：{原始URL: 飞书img_key}
                     "processing_images": set()  # 添加正在处理的图片URL集合
                 }
@@ -315,19 +298,18 @@ class FeishuBotService:
                 
                 if card_result.get("code") != 0:
                     logger.error(f"创建流式卡片失败: {card_result}")
-                    # 回退到普通文本回复
-                    return await self.generate_reply(user_message, user_id)
+                    return
                 
                 card_id = card_result.get("data", {}).get("card_id")
                 if not card_id:
                     logger.error("创建流式卡片成功但未获取到card_id")
-                    return await self.generate_reply(user_message, user_id)
+                    return
                 
                 # 2. 发送初始卡片消息
                 send_result = await self._send_card_message_by_id(receive_id, card_id, receive_id_type)
                 if send_result.get("code") != 0:
                     logger.error(f"发送流式卡片消息失败: {send_result}")
-                    return await self.generate_reply(user_message, user_id)
+                    return
                 
                 logger.info(f"流式卡片已发送: card_id={card_id}")
                 
@@ -362,8 +344,21 @@ class FeishuBotService:
                 async def on_think_callback(think_text: str):
                     nonlocal sequence_counter, think_title_updated, current_card_state
 
+                    # 处理文本中的图片链接（使用缓存避免重复处理）
+                    try:
+                        processed_think_text = await self._process_images_in_text_with_cache(
+                            think_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                        )
+                        
+                        # 使用处理后的文本
+                        think_text = processed_think_text
+                        
+                    except Exception as e:
+                        logger.error(f"处理思考文本中的图片失败: {str(e)}")
+                        # 图片处理失败时继续使用原文本
+
                     async with sequence_lock:
-                        # 首次有思考内容时，设置思考标题和思考内容（不受频率限制）
+                        # 首次有思考内容时，设置思考标题和思考内容
                         if not think_title_updated and think_text:
                             think_sequence = sequence_counter
                             sequence_counter += 1
@@ -385,20 +380,20 @@ class FeishuBotService:
                             else:
                                 logger.error(f"全量更新思考面板标题失败: {update_result}")
                                 think_title_updated = False  # 失败时重置标志位
-
-                        think_sequence = sequence_counter
-                        sequence_counter += 1
-                        current_card_state["think_content"] = think_text
-                        # 更新思考内容
-                        update_result = await self._update_card_element_content(
-                            card_id, "think_content", think_text, think_sequence
-                        )
-                        
-                        if update_result.get("code") == 0:
-                            # logger.debug(f"更新思考过程成功: 长度={len(think_text)}")
-                            pass
                         else:
-                            logger.error(f"更新思考过程失败: {update_result}")
+                            think_sequence = sequence_counter
+                            sequence_counter += 1
+                            current_card_state["think_content"] = think_text
+                            # 更新思考内容
+                            update_result = await self._update_card_element_content(
+                                card_id, "think_content", think_text, think_sequence
+                            )
+                            
+                            if update_result.get("code") == 0:
+                                # logger.debug(f"更新思考过程成功: 长度={len(think_text)}")
+                                pass
+                            else:
+                                logger.error(f"更新思考过程失败: {update_result}")
                 
                 async def on_answer_callback(answer_text: str):
                     nonlocal sequence_counter, answer_title_updated, current_card_state
@@ -417,11 +412,11 @@ class FeishuBotService:
                         # 图片处理失败时继续使用原文本
                     
                     # 构建答案内容
-                    answer_content = f"**回答**\n\n{answer_text}"
+                    answer_content = f"💡**回答**\n\n{answer_text}"
                     current_card_state["answer_content"] = answer_content
                     
                     async with sequence_lock:
-                        # 首次更新答案时，更新思考面板标题和答案内容（不受频率限制）
+                        # 首次更新答案时，更新思考面板标题和答案内容
                         if not answer_title_updated and answer_text:
                             answer_sequence = sequence_counter
                             sequence_counter += 1
@@ -429,7 +424,8 @@ class FeishuBotService:
                             
                             think_title = "💭 **已完成思考**"
                             current_card_state["think_title"] = think_title
-                            current_card_state["answer_content"] = " "
+                            current_card_state["answer_content"] = answer_content
+                            current_card_state["think_finished"] = True
                             # 构建完整的卡片内容
                             complete_card_content = self._build_card_content(current_card_state)
                             
@@ -442,19 +438,19 @@ class FeishuBotService:
                             else:
                                 logger.error(f"全量更新答案面板标题失败: {update_result}")
                                 answer_title_updated = False  # 失败时重置标志位
-                        
-                        answer_sequence = sequence_counter
-                        sequence_counter += 1
-                        # 更新答案部分
-                        update_result = await self._update_card_element_content(
-                            card_id, "answer", answer_content, answer_sequence
-                        )
-                        
-                        if update_result.get("code") == 0:
-                            # logger.debug(f"更新答案成功: 长度={len(answer_text)}")
-                            pass
                         else:
-                            logger.error(f"更新答案失败: {update_result}")
+                            answer_sequence = sequence_counter
+                            sequence_counter += 1
+                            # 更新答案部分
+                            update_result = await self._update_card_element_content(
+                                card_id, "answer", answer_content, answer_sequence
+                            )
+                            
+                            if update_result.get("code") == 0:
+                                # logger.debug(f"更新答案成功: 长度={len(answer_text)}")
+                                pass
+                            else:
+                                logger.error(f"更新答案失败: {update_result}")
                 
                 async def on_references_callback(references_data: list):
                     """处理引用数据回调"""
@@ -466,34 +462,15 @@ class FeishuBotService:
                             
                             # 更新卡片状态中的引用信息
                             current_card_state["references_title"] = f"📚 **知识库引用** ({len(references_data)})"
-                            
-                            # 构建引用内容
                             current_card_state["references_content"] = await self._get_references_content(references_data)
-
-                            # 使用全量更新卡片
-                            async with sequence_lock:
-                                ref_sequence = sequence_counter
-                                sequence_counter += 1
-                                
-                                # 构建完整的卡片内容
-                                complete_card_content = self._build_card_content(current_card_state)
-                                
-                                # 使用新的API进行全量更新
-                                logger.info(f"准备进行引用内容全量更新: 引用部分")
-                                update_result = await self._update_card_settings(card_id, complete_card_content, ref_sequence)
-                                
-                                if update_result.get("code") == 0:
-                                    logger.info(f"引用内容全量更新成功")
-                                else:
-                                    logger.error(f"引用内容全量更新失败: {update_result}")
                         else:
                             logger.debug("引用数据为空，跳过更新")
                     except Exception as e:
                         logger.error(f"处理引用数据异常: {str(e)}")
                 
                 # 调用AI Chat详细流式接口（使用新的回调结构）
-                ai_reply = await self.aichat_service.chat_completion_streaming_enhanced(
-                    chat_id="feishu_user_" + user_id,
+                ai_answer = await self.aichat_service.chat_completion_streaming_enhanced(
+                    chat_id=f"feishu_{app_name}_user_{user_id}",
                     message=user_message,
                     variables={
                         "feishu_user_id": user_info["user_id"],
@@ -506,15 +483,20 @@ class FeishuBotService:
                     on_references_callback=on_references_callback
                 )
                 
-                if ai_reply and ai_reply.strip():
-                    logger.info(f"AI流式回复成功，长度: {len(ai_reply)}")
-                    return ai_reply
+                if ai_answer:
+                    logger.info(f"AI流式回复成功，答案长度: {len(ai_answer)}")
+                    current_card_state["answer_content"] = "💡**回答**\n\n" + ai_answer
+                    current_card_state["bot_summary"] = "💡回答：" + ai_answer
                 else:
                     logger.warning("AI流式回复为空")
-                    # 更新卡片显示错误信息
-                    error_content = "**回答**\n\n抱歉，我暂时无法理解您的问题，请换个方式提问。"
-                    await self._update_card_element_content(card_id, "answer", error_content, sequence_counter)
-                    return "抱歉，我暂时无法理解您的问题，请换个方式提问。"
+                    current_card_state["answer_content"] = "抱歉，我暂时无法理解您的问题，请换个方式提问。"
+                    current_card_state["bot_summary"] = "回答失败"
+
+                # 最终更新卡片内容
+                complete_card_content = self._build_card_content(current_card_state)
+                await self._update_card_settings(card_id, complete_card_content, sequence_counter)
+                
+                return ai_answer
             
             # 如果AI服务不可用，使用默认回复
             return self._get_default_reply(user_message)
@@ -537,12 +519,17 @@ class FeishuBotService:
             Dict[str, Any]: 完整的卡片内容
         """
         
+        # 获取应用名称，如果没有配置则使用默认值
+        app_name = "🤖 AI助手"
+        if self.app_config and hasattr(self.app_config, 'app_name'):
+            app_name = f"🔍 {self.app_config.app_name}"
+        
         # 构建基础卡片结构
         card = {
             "schema": "2.0",
             "header": {
                 "title": {
-                    "content": "🤖 AI助手",
+                    "content": app_name,
                     "tag": "plain_text"
                 }
             },
@@ -550,7 +537,7 @@ class FeishuBotService:
                 "streaming_mode": True,
                 "update_multi": True,
                 "summary": {
-                    "content": "AI正在思考中..."
+                    "content": card_state.get("bot_summary", "AI正在思考中...")
                 },
                 "streaming_config": {
                     "print_frequency_ms": {
@@ -563,7 +550,9 @@ class FeishuBotService:
                         "default": 3
                     },
                     "print_strategy": "fast"
-                }
+                },
+                "enable_forward": True,
+                "width_mode": "fill"
             },
             "body": {
                 "elements": []
@@ -606,7 +595,7 @@ class FeishuBotService:
             elements.append({"tag": "hr"})
             elements.append({
                 "tag": "collapsible_panel",
-                "expanded": True,
+                "expanded": not card_state.get("think_finished", False),
                 "header": {
                     "title": {
                         "tag": "markdown",
@@ -920,47 +909,6 @@ class FeishuBotService:
             logger.error(f"构建引用内容异常: {str(e)}")
             return None
 
-    async def _close_streaming_mode(self, card_id: str) -> dict:
-        """关闭流式模式（内部方法）"""
-        try:
-            token = await self.get_tenant_access_token()
-            url = f"{self.base_url}/open-apis/interactive/v1/card/{card_id}/update_config"
-            
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            body_data = {
-                "config": {
-                    "streaming_mode": False
-                }
-            }
-            
-            # 使用临时的客户端会话避免事件循环冲突
-            async with aiohttp.ClientSession() as client:
-                async with client.patch(url, json=body_data, headers=headers) as response:
-                    result = await response.json()
-                    
-                    if result.get("code") == 0:
-                        return {
-                            "code": 0,
-                            "data": result.get("data", {})
-                        }
-                    else:
-                        logger.error(f"关闭流式模式失败: {result}")
-                        return {
-                            "code": result.get("code", -1),
-                            "msg": result.get("msg", "关闭流式模式失败")
-                        }
-                    
-        except Exception as e:
-            logger.error(f"关闭流式模式异常: {str(e)}")
-            return {
-                "code": -1,
-                "msg": f"关闭流式模式异常: {str(e)}"
-            }
-    
     def _get_default_reply(self, user_message: str) -> str:
         """获取默认回复（关键词匹配）"""
         if "帮助" in user_message or "help" in user_message.lower():
@@ -1140,6 +1088,43 @@ class FeishuBotService:
             str: 本地文件路径，失败返回None
         """
         try:
+            # 检查是否为本地图床URL，如果是则直接从文件系统读取
+            if self.app_config:
+                image_bed_base_url = getattr(self.app_config, 'image_bed_base_url', None)
+                
+                if image_bed_base_url and image_url.startswith(image_bed_base_url):
+                    # 这是本地图床的图片，直接从静态文件目录读取
+                    try:
+                        # 从URL中提取相对路径：/static/images/filename.ext
+                        # 例如：http://domain.com/static/images/abc.png -> /static/images/abc.png
+                        url_path = image_url.replace(image_bed_base_url.rstrip('/'), '', 1)
+                        
+                        if url_path.startswith('/static/images/'):
+                            # 提取图片文件名
+                            match = re.search(r'/static/images/([^/?]+)', url_path)
+                            if match:
+                                filename = match.group(1)
+                                static_image_path = os.path.join("static", "images", filename)
+                                
+                                if os.path.exists(static_image_path):
+                                    # 创建临时文件复制
+                                    suffix = os.path.splitext(filename)[-1] or '.jpg'
+                                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                                    temp_path = temp_file.name
+                                    temp_file.close()
+                                    
+                                    # 直接复制文件
+                                    shutil.copy2(static_image_path, temp_path)
+                                    
+                                    logger.info(f"本地图片直接复制: {static_image_path} -> {temp_path}")
+                                    return temp_path
+                                else:
+                                    logger.warning(f"本地图片文件不存在: {static_image_path}")
+                                    # 继续使用HTTP下载作为回退
+                    except Exception as e:
+                        logger.warning(f"本地图片处理失败，回退到HTTP下载: {str(e)}")
+                        # 继续使用HTTP下载作为回退
+            
             # 创建临时文件
             suffix = os.path.splitext(image_url.split('?')[0])[-1] or '.jpg'
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)

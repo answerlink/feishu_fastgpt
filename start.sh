@@ -17,7 +17,7 @@ PID=$(pgrep -f $PROGRAM_NAME)
 
 if [ -n "$PID" ]; then
     echo "Stopping existing instance of $PROGRAM_NAME with PID $PID..."
-    kill -9 $PID
+    kill $PID
     sleep 2  # 等待进程完全停止
 else
     echo "No existing instance of $PROGRAM_NAME found."

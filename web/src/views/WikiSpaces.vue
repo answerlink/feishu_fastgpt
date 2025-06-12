@@ -49,15 +49,16 @@
           <div class="space-list">
             <el-table
               v-loading="loading"
-              :data="spaces"
+              :data="paginatedSpaces"
               style="width: 100%"
               @row-click="handleSpaceClick"
               highlight-current-row
+              :show-header="true"
             >
               <el-table-column prop="name" label="空间名称" />
               <el-table-column prop="space_type" label="类型" width="80">
                 <template #default="scope">
-                  <el-tag :type="scope.row.space_type === 'team' ? 'success' : 'info'">
+                  <el-tag :type="scope.row.space_type === 'team' ? 'success' : 'info'" size="small">
                     {{ scope.row.space_type }}
                   </el-tag>
                 </template>
@@ -70,13 +71,32 @@
                     @change="(val) => handleSubscriptionChange(scope.row, val)"
                     :active-value="true"
                     :inactive-value="false"
+                    size="small"
                   />
                 </template>
               </el-table-column>
             </el-table>
 
-            <div class="pagination" v-if="hasMore">
-              <el-button :loading="loading" @click="loadMore">加载更多</el-button>
+            <!-- 表格分页 -->
+            <div class="table-pagination" v-if="spaces.length > 0">
+              <el-pagination
+                v-model:current-page="currentPage"
+                v-model:page-size="pageSize"
+                :page-sizes="[10, 20, 50, 100]"
+                layout="total, sizes, prev, pager, next, jumper"
+                :total="spaces.length"
+                :small="true"
+                background
+                @size-change="handleSizeChange"
+                @current-change="handleCurrentChange"
+              />
+            </div>
+
+            <!-- 加载更多按钮 -->
+            <div class="load-more" v-if="hasMore">
+              <el-button :loading="loading" @click="loadMore" size="small" type="primary">
+                加载更多空间
+              </el-button>
             </div>
           </div>
         </el-col>
@@ -86,46 +106,48 @@
             <div class="tree-header" v-if="selectedSpace">
               <h3>{{ selectedSpace.name }} - 文档结构 <span class="space-id">({{ selectedSpace.space_id }})</span></h3>
               <div class="space-stats" v-if="selectedSpace.subscribed">
-                <el-tag type="success">已订阅文档: {{ selectedSpace.doc_count || 0 }} 个</el-tag>
-                <el-tag type="info" v-if="selectedSpace.last_sync_time">
+                <el-tag type="success" size="small">已订阅文档: {{ selectedSpace.doc_count || 0 }} 个</el-tag>
+                <el-tag type="info" size="small" v-if="selectedSpace.last_sync_time">
                   最后同步: {{ formatDate(selectedSpace.last_sync_time) }}
                 </el-tag>
               </div>
             </div>
-            <el-tree
-              v-if="selectedSpace"
-              :data="nodeTree"
-              :props="defaultProps"
-              :load="loadNode"
-              lazy
-              node-key="node_token"
-              :default-expand-all="false"
-              :highlight-current="true"
-              class="outline-tree"
-              @node-click="handleNodeClick"
-            >
-              <template #default="{ node, data }">
-                <div class="custom-tree-node">
-                  <span class="node-icon">
-                    <el-icon v-if="data.has_child"><FolderOpened /></el-icon>
-                    <el-icon v-else><Document /></el-icon>
-                  </span>
-                  <span class="node-title">{{ data.title }}</span>
-                  <div class="node-actions">
-                    <span v-if="data.obj_type && isPreviewable(data.obj_type)" class="preview-btn" @click.stop="previewDoc(data)">
-                      <el-icon><View /></el-icon>
+            <div class="tree-container">
+              <el-tree
+                v-if="selectedSpace"
+                :data="nodeTree"
+                :props="defaultProps"
+                :load="loadNode"
+                lazy
+                node-key="node_token"
+                :default-expand-all="false"
+                :highlight-current="true"
+                class="outline-tree"
+                @node-click="handleNodeClick"
+              >
+                <template #default="{ node, data }">
+                  <div class="custom-tree-node">
+                    <span class="node-icon">
+                      <el-icon v-if="data.has_child"><FolderOpened /></el-icon>
+                      <el-icon v-else><Document /></el-icon>
                     </span>
-                    <span class="node-type" v-if="data.obj_type">
-                      <el-tag size="small" :type="getNodeTypeTag(data.obj_type)">
-                        {{ getNodeTypeName(data.obj_type) }}
-                      </el-tag>
-                    </span>
+                    <span class="node-title">{{ data.title }}</span>
+                    <div class="node-actions">
+                      <span v-if="data.obj_type && isPreviewable(data.obj_type)" class="preview-btn" @click.stop="previewDoc(data)">
+                        <el-icon><View /></el-icon>
+                      </span>
+                      <span class="node-type" v-if="data.obj_type">
+                        <el-tag size="small" :type="getNodeTypeTag(data.obj_type)">
+                          {{ getNodeTypeName(data.obj_type) }}
+                        </el-tag>
+                      </span>
+                    </div>
                   </div>
-                </div>
-              </template>
-            </el-tree>
-            <div v-else class="no-space-selected">
-              请选择一个知识空间
+                </template>
+              </el-tree>
+              <div v-else class="no-space-selected">
+                <el-empty description="请选择一个知识空间查看文档结构" :image-size="100" />
+              </div>
             </div>
           </div>
         </el-col>
@@ -146,7 +168,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Document, FolderOpened, View, ArrowDown } from '@element-plus/icons-vue'
@@ -162,6 +184,18 @@ const nodeTree = ref([])
 const selectedSpace = ref(null)
 const nodeLoading = ref(false)
 const subscriptionsLoading = ref(false)
+
+// 分页相关
+const currentPage = ref(1)
+const pageSize = ref(20)
+
+// 计算属性：当前页的空间列表
+const paginatedSpaces = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  const end = start + pageSize.value
+  return spaces.value.slice(start, end)
+})
+
 const defaultProps = {
   label: 'title',
   children: 'children',
@@ -246,6 +280,13 @@ const loadApps = async () => {
   try {
     const response = await axios.get('/api/v1/test/apps')
     apps.value = response.data.apps
+    
+    // 自动选择第一个应用并加载知识空间列表
+    if (apps.value.length > 0 && !selectedAppId.value) {
+      selectedAppId.value = apps.value[0].app_id
+      // 加载第一个应用的知识空间列表
+      await loadSpaces(selectedAppId.value)
+    }
   } catch (error) {
     ElMessage.error('加载应用列表失败')
     console.error('加载应用列表失败:', error)
@@ -594,6 +635,16 @@ const closeDocPreview = () => {
   showDocPreview.value = false
 }
 
+// 分页处理方法
+const handleSizeChange = (newSize) => {
+  pageSize.value = newSize
+  currentPage.value = 1
+}
+
+const handleCurrentChange = (newPage) => {
+  currentPage.value = newPage
+}
+
 const handleSchedulerCommand = async (command) => {
   // 处理调度器命令
   try {
@@ -669,8 +720,8 @@ const handleSchedulerCommand = async (command) => {
   }
 }
 
-onMounted(() => {
-  loadApps()
+onMounted(async () => {
+  await loadApps()
   
   // 如果已经选择了应用，加载订阅状态
   if (selectedAppId.value) {
@@ -687,6 +738,8 @@ onBeforeUnmount(() => {
 <style scoped>
 .wiki-spaces {
   padding: 20px;
+  height: calc(100vh - 40px);
+  overflow: hidden;
 }
 
 .card-header {
@@ -700,40 +753,77 @@ onBeforeUnmount(() => {
   align-items: center;
 }
 
-.pagination {
-  margin-top: 20px;
+.table-pagination {
+  margin-top: 10px;
+  display: flex;
+  justify-content: center;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.load-more {
+  margin-top: 10px;
   text-align: center;
+  height: 32px;
+  flex-shrink: 0;
 }
 
 .space-list {
   border-right: 1px solid #eee;
   padding-right: 20px;
+  height: 600px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.space-list .el-table {
+  flex: 1;
+  min-height: 0;
 }
 
 .node-tree {
   padding-left: 20px;
-  min-height: 400px;
+  height: 600px;
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-container {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  padding: 10px;
+  background-color: #fafafa;
+  min-height: 0;
 }
 
 .tree-header {
-  margin-bottom: 20px;
+  margin-bottom: 15px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e4e7ed;
+  flex-shrink: 0;
 }
 
 .tree-header h3 {
-  margin: 0;
-  color: #606266;
+  margin: 0 0 10px 0;
+  color: #303133;
+  font-size: 16px;
 }
 
 .space-stats {
-  margin-top: 10px;
   display: flex;
-  gap: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .no-space-selected {
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
   color: #909399;
-  margin-top: 100px;
 }
 
 .custom-tree-node {
@@ -742,27 +832,33 @@ onBeforeUnmount(() => {
   align-items: center;
   font-size: 14px;
   padding-right: 8px;
+  min-height: 24px;
 }
 
 .node-icon {
   margin-right: 8px;
   color: #909399;
+  font-size: 16px;
 }
 
 .node-title {
   flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .node-actions {
   display: flex;
   align-items: center;
+  gap: 8px;
 }
 
 .preview-btn {
-  margin-right: 8px;
   cursor: pointer;
   color: #409EFF;
   transition: color 0.3s;
+  font-size: 16px;
 }
 
 .preview-btn:hover {
@@ -774,11 +870,65 @@ onBeforeUnmount(() => {
 }
 
 .outline-tree {
-  margin-top: 10px;
+  height: 100%;
+  overflow: auto;
 }
 
 .space-id {
   font-size: 0.8em;
   color: #909399;
+  font-weight: normal;
+}
+
+/* Element Plus Card 内容区域样式调整 */
+:deep(.el-card__body) {
+  height: calc(100vh - 140px);
+  overflow: hidden;
+  padding: 20px;
+}
+
+/* Element Plus 表格样式调整 */
+:deep(.el-table) {
+  height: 100% !important;
+}
+
+:deep(.el-table .el-table__body-wrapper) {
+  max-height: calc(100% - 40px) !important;
+}
+
+/* 响应式设计 */
+@media (max-width: 1200px) {
+  .space-list,
+  .node-tree {
+    height: 500px;
+  }
+  
+  :deep(.el-card__body) {
+    height: calc(100vh - 120px);
+  }
+}
+
+@media (max-width: 768px) {
+  .wiki-spaces {
+    padding: 10px;
+  }
+  
+  .space-list,
+  .node-tree {
+    height: 400px;
+  }
+  
+  .space-list {
+    padding-right: 10px;
+  }
+  
+  .node-tree {
+    padding-left: 10px;
+  }
+  
+  :deep(.el-card__body) {
+    height: calc(100vh - 100px);
+    padding: 10px;
+  }
 }
 </style> 

@@ -302,12 +302,13 @@ export default {
     // 获取应用列表
     const getAppList = async () => {
       try {
-        const response = await axios.get('/api/v1/callback/status')
-        if (response.data && response.data.services) {
-          appList.value = response.data.services
+        const response = await axios.get('/api/v1/test/apps')
+        if (response.data && response.data.apps) {
+          appList.value = response.data.apps
         }
       } catch (error) {
         console.error('获取应用列表失败:', error)
+        ElMessage.error('获取应用列表失败，请检查网络连接')
       }
     }
 

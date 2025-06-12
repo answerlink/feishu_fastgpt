@@ -219,3 +219,51 @@ http://localhost:8000/docs
 ## 许可证
 
 [MIT License](LICENSE) 
+
+## 支持的操作
+
+- **订阅文档变更**: 监听指定文档的变更事件
+- **获取文档内容**: 获取云文档(docx)、多维表格(sheet)等内容
+- **智能聊天**: 与机器人对话，支持文档问答
+- **知识库同步**: 自动同步文档到FastGPT知识库
+- **图片处理**: 支持文档中的图片提取和描述
+
+## 知识库描述自动生成
+
+### 功能说明
+
+项目新增了知识库描述自动生成功能，在每次更新FastGPT的dataset时，会自动：
+
+1. 获取dataset中的所有collection（文件列表）
+2. 根据文件名称调用LLM生成描述
+3. 将生成的描述更新到dataset中
+
+### 配置参数
+
+在应用配置中新增了4个LLM相关配置参数：
+
+```json
+{
+    "summary_llm_api_url": "https://api.siliconflow.cn/v1/chat/completions",
+    "summary_llm_api_key": "sk-xxxxx",
+    "summary_llm_model": "Qwen/Qwen3-32B",
+    "summary_llm_model_prompt": "请给这个文件夹添加一段简洁易懂的描述，让用户可以快速了解这个文件夹的内容。"
+}
+```
+
+### 触发时机
+
+- **自动触发**: 每次文档同步到FastGPT后自动执行
+- **手动触发**: 可通过API接口手动生成描述
+
+### 手动生成API
+
+```bash
+POST /api/v1/document/generate-dataset-description?app_id={app_id}&dataset_id={dataset_id}
+```
+
+### 注意事项
+
+- 只有设置了`dataset_sync: true`的应用会启用此功能
+- 需要配置完整的4个LLM参数才会生效
+- 功能异常不会影响文档同步的主流程

@@ -324,11 +324,11 @@ class FastGPTService:
                 "msg": f"检查文档存在性异常: {str(e)}"
             }
     
-    async def delete_document_from_dataset(self, collection_id: str) -> dict:
-        """删除知识库中的文档
+    async def delete_collection(self, collection_id: str) -> dict:
+        """删除知识库中的集合
         
         Args:
-            collection_id: 文档在FastGPT中的ID
+            collection_id: 集合ID
             
         Returns:
             dict: 删除结果
@@ -346,22 +346,315 @@ class FastGPTService:
             async with self.client.delete(url, params=params, headers=headers) as response:
                 result = await response.json()
                 if result.get("code") == 200:
-                    logger.info(f"成功删除FastGPT文档: collection_id={collection_id}")
+                    logger.info(f"成功删除FastGPT集合: collection_id={collection_id}")
                     return {
-                        "code": 0,
-                        "msg": "删除文档成功"
+                        "code": 200,
+                        "msg": "删除集合成功"
                     }
                 else:
-                    logger.error(f"删除FastGPT文档失败: collection_id={collection_id}, error={result}")
+                    logger.error(f"删除FastGPT集合失败: collection_id={collection_id}, error={result}")
                     return {
                         "code": -1,
-                        "msg": f"删除文档失败: {result.get('message', '未知错误')}"
+                        "msg": f"删除集合失败: {result.get('message', '未知错误')}"
                     }
         except Exception as e:
-            logger.error(f"删除FastGPT文档异常: collection_id={collection_id}, error={str(e)}")
+            logger.error(f"删除FastGPT集合异常: collection_id={collection_id}, error={str(e)}")
             return {
                 "code": -1,
-                "msg": f"删除文档异常: {str(e)}"
+                "msg": f"删除集合异常: {str(e)}"
+            }
+    
+    async def get_collection_list(self, dataset_id: str, parent_id: str = None, search_text: str = None) -> dict:
+        """获取知识库中的集合列表
+        
+        Args:
+            dataset_id: 知识库ID
+            parent_id: 父级ID，可选
+            search_text: 模糊搜索文本，可选
+            
+        Returns:
+            dict: 集合列表
+        """
+        data = {
+            "offset": 0,
+            "pageSize": 30,  # FastGPT最大支持30
+            "datasetId": dataset_id,
+            "parentId": parent_id or "",
+            "searchText": search_text or ""
+        }
+        
+        result = await self._request("POST", "/api/core/dataset/collection/listV2", data)
+        
+        if result.get("code") == 200:
+            collections = result.get("data", {}).get("list", [])
+            total = result.get("data", {}).get("total", 0)
+            if search_text:
+                logger.info(f"成功搜索知识库集合列表，搜索词='{search_text}'，共 {len(collections)} 项")
+            else:
+                logger.info(f"成功获取知识库集合列表，共 {len(collections)} 项")
+        else:
+            logger.error(f"获取知识库集合列表失败: {result.get('message')}")
+            
+        return result
+
+    async def delete_collections_by_name(self, dataset_id: str, filename: str, parent_id: str = None) -> dict:
+        """按文件名删除知识库中的重复集合
+        
+        Args:
+            dataset_id: 知识库ID
+            filename: 要删除的文件名（精确匹配）
+            parent_id: 父级ID，可选
+            
+        Returns:
+            dict: 删除结果，包含删除的集合数量
+        """
+        deleted_count = 0
+        delete_errors = []
+        
+        try:
+            # 获取集合列表，使用文件名进行搜索
+            list_result = await self.get_collection_list(dataset_id, parent_id, search_text=filename)
+            
+            if list_result.get("code") != 200:
+                return {
+                    "code": -1,
+                    "msg": f"获取集合列表失败: {list_result.get('message')}",
+                    "deleted_count": 0
+                }
+            
+            collections = list_result.get("data", {}).get("list", [])
+            
+            # 在搜索结果中查找精确匹配的文件名
+            matching_collections = []
+            for collection in collections:
+                collection_name = collection.get("name", "")
+                
+                # 精确匹配文件名
+                if collection_name == filename:
+                    matching_collections.append(collection)
+                    logger.info(f"找到精确匹配的集合: {collection_name} (ID: {collection.get('_id')})")
+            
+            if not matching_collections:
+                logger.info(f"未找到名称为 '{filename}' 的集合")
+                return {
+                    "code": 0,
+                    "msg": f"未找到名称为 '{filename}' 的集合",
+                    "deleted_count": 0
+                }
+            
+            # 删除匹配的集合
+            for collection in matching_collections:
+                collection_id = collection.get("_id")
+                collection_name = collection.get("name")
+                
+                try:
+                    delete_result = await self.delete_collection(collection_id)
+                    if delete_result.get("code") == 200:
+                        deleted_count += 1
+                        logger.info(f"成功删除集合: {collection_name} (ID: {collection_id})")
+                    else:
+                        error_msg = f"删除集合失败: {collection_name}, 错误: {delete_result.get('message')}"
+                        delete_errors.append(error_msg)
+                        logger.error(error_msg)
+                except Exception as e:
+                    error_msg = f"删除集合异常: {collection_name}, 错误: {str(e)}"
+                    delete_errors.append(error_msg)
+                    logger.error(error_msg)
+            
+            result_msg = f"按文件名删除完成，成功删除 {deleted_count} 个集合"
+            if delete_errors:
+                result_msg += f"，{len(delete_errors)} 个删除失败"
+                
+            return {
+                "code": 0 if deleted_count > 0 else -1,
+                "msg": result_msg,
+                "deleted_count": deleted_count,
+                "errors": delete_errors
+            }
+            
+        except Exception as e:
+            logger.error(f"按文件名删除集合异常: filename={filename}, error={str(e)}")
+            return {
+                "code": -1,
+                "msg": f"按文件名删除集合异常: {str(e)}",
+                "deleted_count": 0
+            }
+    
+    async def call_summary_llm(self, prompt: str, filenames: List[str]) -> str:
+        """调用摘要LLM生成描述
+        
+        Args:
+            prompt: 系统提示词
+            filenames: 文件名列表
+            
+        Returns:
+            str: 生成的描述
+        """
+        if not self.app_config.summary_llm_api_url or not self.app_config.summary_llm_api_key:
+            logger.warning("摘要LLM配置不完整，跳过描述生成")
+            return ""
+        
+        try:
+            # 构建用户消息
+            filenames_text = "\n".join([f"- {filename}" for filename in filenames])
+            user_message = f"文件列表：\n{filenames_text}"
+            
+            # 构建请求数据
+            request_data = {
+                "model": self.app_config.summary_llm_model,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 500,
+                "enable_thinking": False,
+                "chat_template_kwargs": {
+                    "enable_thinking": False
+                }
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.app_config.summary_llm_api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            async with self.client.post(
+                self.app_config.summary_llm_api_url,
+                headers=headers,
+                json=request_data
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    description = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    logger.info(f"成功生成描述: {description}")
+                    return description
+                else:
+                    error_text = await response.text()
+                    logger.error(f"调用摘要LLM失败: {response.status} - {error_text}")
+                    return ""
+        except Exception as e:
+            logger.error(f"调用摘要LLM异常: {str(e)}")
+            return ""
+    
+    async def update_dataset_description(self, dataset_id: str, description: str) -> dict:
+        """更新知识库描述
+        
+        Args:
+            dataset_id: 知识库ID
+            description: 新的描述
+            
+        Returns:
+            dict: 更新结果
+        """
+        try:
+            # 准备更新数据，只需要id和intro字段
+            update_data = {
+                "id": dataset_id,
+                "intro": description
+            }
+            
+            result = await self._request("POST", "/api/core/dataset/update", update_data)
+            
+            if result.get("code") == 200:
+                logger.info(f"成功更新知识库描述: dataset_id={dataset_id}, description={description}")
+            else:
+                logger.error(f"更新知识库描述失败: dataset_id={dataset_id}, 错误: {result.get('message')}")
+            
+            return result
+        except Exception as e:
+            logger.error(f"更新知识库描述异常: dataset_id={dataset_id}, error={str(e)}")
+            return {
+                "code": -1,
+                "message": f"更新知识库描述异常: {str(e)}"
+            }
+    
+    async def generate_and_update_dataset_description(self, dataset_id: str) -> dict:
+        """根据dataset中的collection列表生成并更新描述
+        
+        Args:
+            dataset_id: 知识库ID
+            
+        Returns:
+            dict: 处理结果
+        """
+        try:
+            # 检查摘要LLM配置
+            if not all([
+                self.app_config.summary_llm_api_url,
+                self.app_config.summary_llm_api_key,
+                self.app_config.summary_llm_model,
+                self.app_config.summary_llm_model_prompt
+            ]):
+                logger.info(f"摘要LLM配置不完整，跳过dataset描述生成: dataset_id={dataset_id}")
+                return {
+                    "code": 0,
+                    "message": "摘要LLM配置不完整，跳过描述生成"
+                }
+            
+            # 获取collection列表
+            collections_result = await self.get_collection_list(dataset_id)
+            
+            if collections_result.get("code") != 200:
+                logger.error(f"获取collection列表失败: {collections_result.get('message')}")
+                return collections_result
+            
+            collections = collections_result.get("data", {}).get("list", [])
+            
+            if not collections:
+                logger.info(f"知识库中没有文件，跳过描述生成: dataset_id={dataset_id}")
+                return {
+                    "code": 0,
+                    "message": "知识库中没有文件，跳过描述生成"
+                }
+            
+            # 提取文件名
+            filenames = [collection.get("name", "") for collection in collections if collection.get("name")]
+            
+            if not filenames:
+                logger.info(f"没有有效的文件名，跳过描述生成: dataset_id={dataset_id}")
+                return {
+                    "code": 0,
+                    "message": "没有有效的文件名，跳过描述生成"
+                }
+            
+            logger.info(f"开始为知识库生成描述: dataset_id={dataset_id}, 文件数量={len(filenames)}")
+            
+            # 调用摘要LLM生成描述
+            description = await self.call_summary_llm(
+                self.app_config.summary_llm_model_prompt,
+                filenames
+            )
+            
+            if not description:
+                logger.warning(f"LLM未生成有效描述: dataset_id={dataset_id}")
+                return {
+                    "code": 0,
+                    "message": "LLM未生成有效描述"
+                }
+            
+            # 更新knowledge库描述
+            update_result = await self.update_dataset_description(dataset_id, description)
+            
+            if update_result.get("code") == 200:
+                logger.info(f"成功生成并更新dataset描述: dataset_id={dataset_id}, description={description}")
+                return {
+                    "code": 200,
+                    "message": "成功生成并更新dataset描述",
+                    "data": {
+                        "dataset_id": dataset_id,
+                        "description": description,
+                        "file_count": len(filenames)
+                    }
+                }
+            else:
+                return update_result
+                
+        except Exception as e:
+            logger.error(f"生成并更新dataset描述异常: dataset_id={dataset_id}, error={str(e)}")
+            return {
+                "code": -1,
+                "message": f"生成并更新dataset描述异常: {str(e)}"
             }
     
     async def __aenter__(self):

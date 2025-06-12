@@ -1,8 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import HomeView from '../views/Home.vue'
+import Home from '../views/Home.vue'
 import WikiSpaces from '../views/WikiSpaces.vue'
 import DocumentSubscribe from '../views/DocumentSubscribe.vue'
-import Callbacks from '../views/Callbacks.vue'
 import Apps from '../views/Apps.vue'
 import LogViewer from '../views/LogViewer.vue'
 
@@ -12,7 +11,22 @@ const router = createRouter({
     {
       path: '/',
       name: 'home',
-      component: HomeView
+      component: Home
+    },
+    {
+      path: '/home',
+      name: 'home-alt',
+      component: Home
+    },
+    {
+      path: '/app-status',
+      name: 'app-status',
+      component: Apps
+    },
+    {
+      path: '/apps',
+      name: 'apps',
+      component: Apps
     },
     {
       path: '/wiki-spaces',
@@ -25,14 +39,9 @@ const router = createRouter({
       component: DocumentSubscribe
     },
     {
-      path: '/callbacks',
-      name: 'callbacks',
-      component: Callbacks
-    },
-    {
-      path: '/apps',
-      name: 'apps',
-      component: Apps
+      path: '/log-viewer',
+      name: 'log-viewer',
+      component: LogViewer
     },
     {
       path: '/logs',

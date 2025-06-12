@@ -74,13 +74,24 @@ class BlockToMarkdown:
         
         # 初始化VLM服务
         vlm_service = None
-        if app_id and app_config and getattr(app_config, 'image_bed_vlm_enable', False):
-            try:
-                from app.utils.vlm_service import VLMService
-                vlm_service = VLMService(app_id)
-                logger.info(f"VLM服务已启用: {app_id}")
-            except Exception as e:
-                logger.error(f"初始化VLM服务失败: {str(e)}")
+        if app_id and app_config:
+            # 检查VLM相关配置是否完整
+            vlm_config_complete = all([
+                getattr(app_config, 'image_bed_vlm_api_url', None),
+                getattr(app_config, 'image_bed_vlm_api_key', None),
+                getattr(app_config, 'image_bed_vlm_model', None),
+                getattr(app_config, 'image_bed_vlm_model_prompt', None)
+            ])
+            
+            if vlm_config_complete:
+                try:
+                    from app.utils.vlm_service import VLMService
+                    vlm_service = VLMService(app_id)
+                    logger.info(f"VLM服务已启用: {app_id}")
+                except Exception as e:
+                    logger.error(f"初始化VLM服务失败: {str(e)}")
+            else:
+                logger.debug(f"VLM配置不完整，跳过VLM服务初始化: {app_id}")
         
         try:
             # 循环处理每个块

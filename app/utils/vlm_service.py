@@ -32,7 +32,6 @@ class VLMService:
         self.api_key = getattr(self.app_config, 'image_bed_vlm_api_key', None)
         self.model = getattr(self.app_config, 'image_bed_vlm_model', '')
         self.prompt = getattr(self.app_config, 'image_bed_vlm_model_prompt', '请用20字以内简洁描述这张图片内容，不要加任何前缀，直接给出描述，参考论文引用图例的格式。')
-        self.enabled = getattr(self.app_config, 'image_bed_vlm_enable', False)
         
         self._client = None
     
@@ -50,8 +49,16 @@ class VLMService:
             self._client = None
     
     def is_enabled(self) -> bool:
-        """检查VLM服务是否启用"""
-        return self.enabled and self.api_url and self.api_key
+        """检查VLM服务是否启用
+        
+        通过检查4个VLM相关配置是否都存在来判断是否启用
+        """
+        return all([
+            self.api_url,
+            self.api_key,
+            self.model,
+            self.prompt
+        ])
     
     def _encode_image_to_base64(self, image_path: str) -> Optional[str]:
         """将图片文件编码为base64
@@ -130,7 +137,11 @@ class VLMService:
                     }
                 ],
                 "max_tokens": 100,
-                "temperature": 0.1
+                "temperature": 0.1,
+                "enable_thinking": False,
+                "chat_template_kwargs": {
+                    "enable_thinking": False
+                }
             }
             
             headers = {
