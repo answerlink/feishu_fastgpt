@@ -3,13 +3,8 @@
 # 定义程序名称
 PROGRAM_NAME="feishu_plus_app.py"
 # 定义虚拟环境名称
-VENV_NAME="feishu-plus"
+VENV_NAME="feishu-fastgpt"
 
-# (root)激活虚拟环境
-#source activate $VENV_NAME
-
-# (llmuser)初始化 conda
-source /export/llmuser/anaconda3/etc/profile.d/conda.sh
 conda activate $VENV_NAME
 
 # 查找正在运行的程序
