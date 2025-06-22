@@ -19,7 +19,6 @@ class FeishuApp(BaseModel):
     summary_llm_api_url: Optional[str] = None  # 摘要LLM API地址
     summary_llm_api_key: Optional[str] = None  # 摘要LLM API密钥
     summary_llm_model: Optional[str] = None  # 摘要LLM模型
-    summary_llm_model_prompt: Optional[str] = None  # 摘要LLM提示词
     
     # 图床相关配置
     image_bed_base_url: Optional[str] = None  # 图床基础URL
@@ -32,11 +31,15 @@ class FeishuApp(BaseModel):
     aichat_enable: Optional[bool] = False  # 是否启用AI Chat功能
     aichat_url: Optional[str] = None  # AI Chat API地址
     aichat_key: Optional[str] = None  # AI Chat API密钥
+    aichat_support_stop_streaming: Optional[bool] = False  # 是否支持停止流式回答
     aichat_client_download_host: Optional[str] = None  # AI Chat读取集合API地址
     aichat_read_collection_url: Optional[str] = None  # AI Chat读取集合API地址
     aichat_read_collection_key: Optional[str] = None  # AI Chat读取集合API密钥
+    asr_api_url: Optional[str] = None  # ASR API地址
+    asr_api_key: Optional[str] = None  # ASR API密钥
     aichat_reply_p2p: Optional[bool] = True  # 是否在私聊中回复
     aichat_reply_group: Optional[bool] = False  # 是否在群聊中回复
+    user_memory_enable: Optional[bool] = True  # 是否启用用户记忆功能
 
 class Settings(BaseModel):
     """应用配置"""

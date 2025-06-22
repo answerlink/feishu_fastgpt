@@ -284,21 +284,324 @@ class FeishuCallbackService:
                     
                     logger.info(f"机器人收到消息 - 发送者: {sender_id} ({sender_type}), 消息类型: {message_type}, 聊天ID: {chat_id} ({chat_type})")
                     
-                    # 处理文本消息
-                    if message_type == "text" and content:
+                    # 处理所有类型的消息（文本、音频、富文本等）
+                    if message_type and content:
                         try:
                             import json
-                            text_content = json.loads(content).get("text", "")
-                            logger.info(f"消息内容: {text_content}")
                             
-                            # 调用机器人服务处理消息
+                            # 根据消息类型记录不同的日志信息
+                            if message_type == "text":
+                                text_content = json.loads(content).get("text", "")
+                                logger.info(f"文本消息内容: {text_content}")
+                            elif message_type == "audio":
+                                audio_content = json.loads(content)
+                                file_key = audio_content.get("file_key")
+                                duration = audio_content.get("duration", 0)
+                                logger.info(f"音频消息内容: file_key={file_key}, duration={duration}ms")
+                            elif message_type == "file":
+                                file_content = json.loads(content)
+                                file_key = file_content.get("file_key")
+                                file_name = file_content.get("file_name", "未知文件")
+                                file_size = file_content.get("file_size", 0)
+                                logger.info(f"文件消息内容: file_key={file_key}, file_name={file_name}, file_size={file_size}")
+                            elif message_type == "post":
+                                post_content = json.loads(content)
+                                logger.info(f"富文本消息内容结构: {json.dumps(post_content, ensure_ascii=False, indent=2)}")
+                            else:
+                                logger.info(f"其他类型消息: {message_type}")
+                            
+                            # 统一调用机器人服务处理消息
                             self._handle_bot_message_async(app_id, data)
                             
                         except Exception as e:
-                            logger.error(f"解析文本消息失败: {str(e)}")
+                            logger.error(f"解析{message_type}消息失败: {str(e)}")
+                    else:
+                        logger.warning(f"收到空消息或未知消息类型: type={message_type}")
                     
                 except Exception as e:
                     logger.error(f"处理机器人消息事件失败: {str(e)}")
+                
+                # 必须返回None，表示成功接收
+                return None
+
+            def do_p2_application_bot_menu_v6(data: lark.application.v6.P2ApplicationBotMenuV6) -> None:
+                """处理机器人菜单事件"""
+                logger.info(f"收到机器人菜单事件: {lark.JSON.marshal(data, indent=4)}")
+                
+                try:
+                    # 解析事件数据
+                    event = data.event
+                    header = data.header
+                    
+                    # 获取事件基本信息
+                    event_key = event.event_key if hasattr(event, 'event_key') else None
+                    timestamp = event.timestamp if hasattr(event, 'timestamp') else None
+                    
+                    # 获取操作用户信息
+                    operator = event.operator if hasattr(event, 'operator') else None
+                    operator_id = None
+                    user_id = None
+                    open_id = None
+                    union_id = None
+                    
+                    if operator and hasattr(operator, 'operator_id'):
+                        operator_info = operator.operator_id
+                        user_id = operator_info.user_id if hasattr(operator_info, 'user_id') else None
+                        open_id = operator_info.open_id if hasattr(operator_info, 'open_id') else None
+                        union_id = operator_info.union_id if hasattr(operator_info, 'union_id') else None
+                    
+                    # 获取应用信息
+                    app_id = header.app_id if hasattr(header, 'app_id') else None
+                    tenant_key = header.tenant_key if hasattr(header, 'tenant_key') else None
+                    event_id = header.event_id if hasattr(header, 'event_id') else None
+                    create_time = header.create_time if hasattr(header, 'create_time') else None
+                    
+                    # 记录详细日志
+                    logger.info(f"机器人菜单事件详情:")
+                    logger.info(f"  事件类型: application.bot.menu_v6")
+                    logger.info(f"  子事件: {event_key}")
+                    logger.info(f"  事件ID: {event_id}")
+                    logger.info(f"  应用ID: {app_id}")
+                    logger.info(f"  租户Key: {tenant_key}")
+                    logger.info(f"  创建时间: {create_time}")
+                    logger.info(f"  时间戳: {timestamp}")
+                    logger.info(f"  操作用户:")
+                    logger.info(f"    User ID: {user_id}")
+                    logger.info(f"    Open ID: {open_id}")
+                    logger.info(f"    Union ID: {union_id}")
+                    
+                    # 针对不同子事件的处理
+                    if event_key == "bot_new_chat":
+                        logger.info(f"处理bot_new_chat事件:")
+                        logger.info(f"  用户 {user_id} (Open ID: {open_id}) 触发了新建聊天菜单")
+                        logger.info(f"  该事件表示用户通过机器人菜单发起了新的对话")
+                        
+                        # 转换时间戳为可读格式
+                        if create_time:
+                            try:
+                                import datetime
+                                create_time_int = int(create_time)
+                                # 如果是毫秒级时间戳，转换为秒级
+                                if create_time_int > 10**10:
+                                    create_time_int = create_time_int // 1000
+                                dt = datetime.datetime.fromtimestamp(create_time_int)
+                                logger.info(f"  事件发生时间: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                            except Exception as e:
+                                logger.warning(f"时间戳转换失败: {str(e)}")
+                        
+                        # 创建新的聊天会话
+                        if app_id and user_id:
+                            try:
+                                from app.services.user_chat_session_service import UserChatSessionService
+                                
+                                # 获取应用名称和配置
+                                app_name = None
+                                app_secret = None
+                                for app in settings.FEISHU_APPS:
+                                    if app.app_id == app_id:
+                                        app_name = app.app_name
+                                        app_secret = app.app_secret
+                                        break
+                                
+                                # 创建聊天会话服务并生成新的chat_id
+                                session_service = UserChatSessionService()
+                                new_chat_id = session_service.create_new_chat_session(
+                                    app_id=app_id,
+                                    user_id=user_id,
+                                    open_id=open_id,
+                                    app_name=app_name
+                                )
+                                
+                                logger.info(f"  已为用户创建新的聊天会话:")
+                                logger.info(f"    应用: {app_name or app_id}")
+                                logger.info(f"    用户ID: {user_id}")
+                                logger.info(f"    新Chat ID: {new_chat_id}")
+                                
+                                # 发送新会话分隔消息（异步执行）
+                                if app_secret:
+                                    try:
+                                        self._send_new_session_message_async(app_id, app_secret, user_id, app_name)
+                                    except Exception as msg_error:
+                                        logger.error(f"启动发送新会话消息失败: {str(msg_error)}")
+                                else:
+                                    logger.warning("缺少app_secret，无法发送新会话消息")
+                                
+                            except Exception as e:
+                                logger.error(f"创建聊天会话失败: {str(e)}")
+                                import traceback
+                                logger.error(f"错误详情: {traceback.format_exc()}")
+                        else:
+                            logger.warning(f"缺少必要参数，无法创建聊天会话: app_id={app_id}, user_id={user_id}")
+                    
+                    elif event_key in ["bot_search_dataset", "bot_search_web", "bot_search_all"]:
+                        logger.info(f"处理搜索模式选择事件: {event_key}")
+                        logger.info(f"  用户 {user_id} (Open ID: {open_id}) 选择了搜索模式")
+                        
+                        # 转换时间戳为可读格式
+                        if create_time:
+                            try:
+                                import datetime
+                                create_time_int = int(create_time)
+                                if create_time_int > 10**10:
+                                    create_time_int = create_time_int // 1000
+                                dt = datetime.datetime.fromtimestamp(create_time_int)
+                                logger.info(f"  事件发生时间: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                            except Exception as e:
+                                logger.warning(f"时间戳转换失败: {str(e)}")
+                        
+                        # 设置搜索偏好
+                        if app_id and user_id:
+                            try:
+                                from app.services.user_chat_session_service import UserChatSessionService
+                                from app.services.user_search_preference_service import UserSearchPreferenceService
+                                
+                                # 获取应用名称和配置
+                                app_name = None
+                                app_secret = None
+                                for app in settings.FEISHU_APPS:
+                                    if app.app_id == app_id:
+                                        app_name = app.app_name
+                                        app_secret = app.app_secret
+                                        break
+                                
+                                # 确定搜索模式
+                                search_mode_map = {
+                                    "bot_search_dataset": "dataset",
+                                    "bot_search_web": "web",
+                                    "bot_search_all": "all"
+                                }
+                                search_mode = search_mode_map.get(event_key)
+                                
+                                # 设置搜索偏好
+                                preference_service = UserSearchPreferenceService()
+                                success = preference_service.set_search_preference(
+                                    app_id=app_id,
+                                    user_id=user_id,
+                                    search_mode=search_mode
+                                )
+                                
+                                if success:
+                                    mode_name = preference_service.get_search_mode_display_name(search_mode)
+                                    logger.info(f"  已设置搜索偏好:")
+                                    logger.info(f"    应用: {app_name or app_id}")
+                                    logger.info(f"    用户ID: {user_id}")
+                                    logger.info(f"    搜索模式: {mode_name}")
+                                    logger.info(f"    该偏好将应用于用户在此应用的所有会话")
+                                    
+                                    # 发送搜索模式设置确认消息
+                                    if app_secret:
+                                        try:
+                                            self._send_search_mode_confirmation_async(
+                                                app_id, app_secret, user_id, search_mode, app_name
+                                            )
+                                        except Exception as msg_error:
+                                            logger.error(f"启动发送搜索模式确认消息失败: {str(msg_error)}")
+                                else:
+                                    logger.error(f"设置搜索偏好失败")
+                                
+                            except Exception as e:
+                                logger.error(f"处理搜索模式选择失败: {str(e)}")
+                                import traceback
+                                logger.error(f"错误详情: {traceback.format_exc()}")
+                        else:
+                            logger.warning(f"缺少必要参数，无法设置搜索偏好: app_id={app_id}, user_id={user_id}")
+                    
+                    else:
+                        logger.info(f"处理其他机器人菜单事件: {event_key}")
+                    
+                except Exception as e:
+                    logger.error(f"处理机器人菜单事件失败: {str(e)}")
+                    import traceback
+                    logger.error(f"错误详情: {traceback.format_exc()}")
+                
+                # 必须返回None，表示成功接收
+                return None
+
+            def do_p2_card_action_trigger(data: 'lark.im.v2.P2CardActionTrigger') -> None:
+                """处理卡片交互事件（停止回答按钮）"""
+                logger.info(f"收到卡片交互事件: {lark.JSON.marshal(data, indent=4)}")
+                
+                try:
+                    # 解析事件数据 - 新版本结构在data.event中
+                    event = data.event
+                    action = event.action if hasattr(event, 'action') else None
+                    context = event.context if hasattr(event, 'context') else None
+                    operator = event.operator if hasattr(event, 'operator') else None
+                    
+                    # 获取操作相关信息
+                    action_value = action.value if action and hasattr(action, 'value') else {}
+                    action_tag = action.tag if action and hasattr(action, 'tag') else None
+                    action_name = action.name if action and hasattr(action, 'name') else None
+                    
+                    # 获取用户信息
+                    open_id = operator.open_id if operator and hasattr(operator, 'open_id') else None
+                    user_id = operator.user_id if operator and hasattr(operator, 'user_id') else None
+                    
+                    # 获取消息上下文
+                    open_message_id = context.open_message_id if context and hasattr(context, 'open_message_id') else None
+                    open_chat_id = context.open_chat_id if context and hasattr(context, 'open_chat_id') else None
+                    
+                    # 获取应用信息
+                    app_id = data.header.app_id if hasattr(data, 'header') and hasattr(data.header, 'app_id') else None
+                    event_id = data.header.event_id if hasattr(data, 'header') and hasattr(data.header, 'event_id') else None
+                    
+                    logger.info(f"卡片交互事件详情:")
+                    logger.info(f"  事件类型: card.action.trigger")
+                    logger.info(f"  事件ID: {event_id}")
+                    logger.info(f"  应用ID: {app_id}")
+                    logger.info(f"  操作类型: {action_tag}")
+                    logger.info(f"  操作名称: {action_name}")
+                    logger.info(f"  回调数据: {action_value}")
+                    logger.info(f"  操作用户: {user_id} (Open ID: {open_id})")
+                    logger.info(f"  消息ID: {open_message_id}")
+                    logger.info(f"  会话ID: {open_chat_id}")
+                    
+                    # 处理停止回答操作
+                    if isinstance(action_value, dict) and action_value.get("action") == "stop_streaming":
+                        card_id = action_value.get("card_id")
+                        
+                        logger.info(f"处理停止回答请求:")
+                        logger.info(f"  卡片ID: {card_id}")
+                        logger.info(f"  用户 {user_id} 请求停止流式回答")
+                        
+                        if app_id and card_id:
+                            try:
+                                # 获取应用配置
+                                app_secret = None
+                                for app in settings.FEISHU_APPS:
+                                    if app.app_id == app_id:
+                                        app_secret = app.app_secret
+                                        break
+                                
+                                if app_secret:
+                                    # 创建飞书机器人服务实例并调用停止方法
+                                    from app.services.feishu_bot import FeishuBotService
+                                    
+                                    bot_service = FeishuBotService(app_id, app_secret)
+                                    success = bot_service.stop_streaming_reply(card_id)
+                                    
+                                    if success:
+                                        logger.info(f"成功设置停止标志，卡片ID: {card_id}")
+                                    else:
+                                        logger.warning(f"设置停止标志失败，卡片ID: {card_id}")
+                                        
+                                else:
+                                    logger.error(f"未找到应用 {app_id} 的配置信息")
+                                    
+                            except Exception as e:
+                                logger.error(f"处理停止回答请求失败: {str(e)}")
+                                import traceback
+                                logger.error(f"错误详情: {traceback.format_exc()}")
+                        else:
+                            logger.warning(f"缺少必要参数: app_id={app_id}, card_id={card_id}")
+                    
+                    else:
+                        logger.info(f"未识别的卡片交互操作: {action_value}")
+                    
+                except Exception as e:
+                    logger.error(f"处理卡片交互事件失败: {str(e)}")
+                    import traceback
+                    logger.error(f"错误详情: {traceback.format_exc()}")
                 
                 # 必须返回None，表示成功接收
                 return None
@@ -318,7 +621,9 @@ class FeishuCallbackService:
                 .register_p2_drive_file_edit_v1(do_p2_drive_file_edit_v1) \
                 .register_p2_drive_file_title_updated_v1(do_p2_drive_file_title_updated_v1) \
                 .register_p2_drive_file_created_in_folder_v1(do_p2_drive_file_created_in_folder_v1) \
-                .register_p2_drive_file_trashed_v1(do_p2_drive_file_trashed_v1)
+                .register_p2_drive_file_trashed_v1(do_p2_drive_file_trashed_v1) \
+                .register_p2_application_bot_menu_v6(do_p2_application_bot_menu_v6) \
+                .register_p2_card_action_trigger(do_p2_card_action_trigger)
             
             # 只有在启用AI Chat时才注册机器人消息事件
             if aichat_enabled:
@@ -335,6 +640,8 @@ class FeishuCallbackService:
             logger.info("- 标题更新事件 (file.title_update_v1)")
             logger.info("- 文件创建事件 (file.created_in_folder_v1)")
             logger.info("- 文件删除事件 (file.trashed_v1)")
+            logger.info("- 机器人菜单事件 (application.bot.menu_v6)")
+            logger.info("- 卡片交互事件 (card.action.trigger)")
             if aichat_enabled:
                 logger.info("- 机器人消息事件 (im.message.receive_v1)")
             else:
@@ -547,7 +854,20 @@ class FeishuCallbackService:
                         "message_type": data.event.message.message_type if hasattr(data.event.message, 'message_type') else None,
                         "content": data.event.message.content if hasattr(data.event.message, 'content') else None,
                         "chat_id": data.event.message.chat_id if hasattr(data.event.message, 'chat_id') else None,
-                        "chat_type": data.event.message.chat_type if hasattr(data.event.message, 'chat_type') else None
+                        "chat_type": data.event.message.chat_type if hasattr(data.event.message, 'chat_type') else None,
+                        "mentions": [
+                            {
+                                "key": mention.key if hasattr(mention, 'key') else None,
+                                "name": mention.name if hasattr(mention, 'name') else None,
+                                "id": {
+                                    "user_id": mention.id.user_id if hasattr(mention, 'id') and hasattr(mention.id, 'user_id') else None,
+                                    "open_id": mention.id.open_id if hasattr(mention, 'id') and hasattr(mention.id, 'open_id') else None,
+                                    "union_id": mention.id.union_id if hasattr(mention, 'id') and hasattr(mention.id, 'union_id') else None
+                                } if hasattr(mention, 'id') else {},
+                                "tenant_key": mention.tenant_key if hasattr(mention, 'tenant_key') else None
+                            }
+                            for mention in (data.event.message.mentions if hasattr(data.event.message, 'mentions') and data.event.message.mentions is not None else [])
+                        ]
                     }
                 }
             }
@@ -563,4 +883,295 @@ class FeishuCallbackService:
         except Exception as e:
             logger.error(f"处理机器人消息失败: {str(e)}")
             import traceback
-            logger.error(f"错误详情: {traceback.format_exc()}") 
+            logger.error(f"错误详情: {traceback.format_exc()}")
+
+    def _send_new_session_message_async(self, app_id: str, app_secret: str, user_id: str, app_name: str = None) -> None:
+        """异步发送新会话分隔消息
+        
+        Args:
+            app_id: 应用ID
+            app_secret: 应用密钥
+            user_id: 用户ID
+            app_name: 应用名称
+        """
+        try:
+            import asyncio
+            import threading
+            
+            # 使用线程池执行器避免事件循环冲突
+            def run_message_sending():
+                try:
+                    # 创建独立的事件循环
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        # 运行异步发送
+                        loop.run_until_complete(self._send_new_session_message(app_id, app_secret, user_id, app_name))
+                    finally:
+                        # 确保循环正确关闭
+                        pending = asyncio.all_tasks(loop)
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.close()
+                        
+                except Exception as e:
+                    logger.error(f"线程中发送新会话消息失败: {str(e)}")
+            
+            # 在独立线程中运行，避免事件循环冲突
+            thread = threading.Thread(target=run_message_sending, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            logger.error(f"启动发送新会话消息失败: {str(e)}")
+
+    async def _send_new_session_message(self, app_id: str, app_secret: str, user_id: str, app_name: str = None) -> None:
+        """发送新会话分隔消息的具体逻辑
+        
+        Args:
+            app_id: 应用ID
+            app_secret: 应用密钥
+            user_id: 用户ID
+            app_name: 应用名称
+        """
+        try:
+            # 导入机器人服务
+            from app.services.feishu_bot import FeishuBotService
+            
+            # 创建机器人服务实例
+            bot_service = FeishuBotService(app_id, app_secret)
+            
+            # 构建新会话分隔卡片
+            card_content = self._build_new_session_card(app_name)
+            
+            # 发送卡片消息给用户
+            success = await bot_service.send_card_message(
+                receive_id=user_id,
+                card_content=card_content,
+                receive_id_type="user_id"
+            )
+            
+            if success:
+                logger.info(f"新会话分隔卡片发送成功: user_id={user_id}")
+            else:
+                logger.warning(f"新会话分隔卡片发送失败: user_id={user_id}")
+                
+        except Exception as e:
+            logger.error(f"发送新会话分隔消息失败: {str(e)}")
+            import traceback
+            logger.error(f"错误详情: {traceback.format_exc()}")
+
+    def _build_new_session_card(self, app_name: str = None) -> dict:
+        """构建新会话分隔卡片
+        
+        Args:
+            app_name: 应用名称
+            
+        Returns:
+            dict: 飞书卡片内容
+        """
+        # 获取当前时间
+        from datetime import datetime
+        current_time = datetime.now().strftime("%H:%M")
+        
+        # 构建应用显示名称
+        if app_name:
+            app_display = app_name
+        else:
+            app_display = "AI助手"
+        
+        # 构建Markdown内容，使用---分隔线
+        markdown_content = f"""---
+
+**✨ 新对话开始** `{current_time}`
+
+🤖 **{app_display}** 为您服务
+
+---
+
+开始全新的对话吧！我会为您提供最佳的帮助。"""
+        
+        # 构建卡片结构
+        card_content = {
+            "schema": "2.0",
+            "header": {
+                "title": {
+                    "content": f"🔄 新会话",
+                    "tag": "plain_text"
+                },
+                "template": "blue"
+            },
+            "config": {
+                "enable_forward": True,
+                "width_mode": "fill"
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": markdown_content
+                    }
+                ]
+            }
+        }
+        
+        return card_content
+
+    def _send_search_mode_confirmation_async(self, app_id: str, app_secret: str, user_id: str, search_mode: str, app_name: str = None) -> None:
+        """异步发送搜索模式设置确认消息
+        
+        Args:
+            app_id: 应用ID
+            app_secret: 应用密钥
+            user_id: 用户ID
+            search_mode: 搜索模式
+            app_name: 应用名称
+        """
+        try:
+            import asyncio
+            import threading
+            
+            # 使用线程池执行器避免事件循环冲突
+            def run_message_sending():
+                try:
+                    # 创建独立的事件循环
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        # 运行异步发送
+                        loop.run_until_complete(self._send_search_mode_confirmation(app_id, app_secret, user_id, search_mode, app_name))
+                    finally:
+                        # 确保循环正确关闭
+                        pending = asyncio.all_tasks(loop)
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.close()
+                        
+                except Exception as e:
+                    logger.error(f"线程中发送搜索模式确认消息失败: {str(e)}")
+            
+            # 在独立线程中运行，避免事件循环冲突
+            thread = threading.Thread(target=run_message_sending, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            logger.error(f"启动发送搜索模式确认消息失败: {str(e)}")
+
+    async def _send_search_mode_confirmation(self, app_id: str, app_secret: str, user_id: str, search_mode: str, app_name: str = None) -> None:
+        """发送搜索模式设置确认消息的具体逻辑
+        
+        Args:
+            app_id: 应用ID
+            app_secret: 应用密钥
+            user_id: 用户ID
+            search_mode: 搜索模式
+            app_name: 应用名称
+        """
+        try:
+            # 导入机器人服务
+            from app.services.feishu_bot import FeishuBotService
+            from app.services.user_search_preference_service import UserSearchPreferenceService
+            
+            # 创建机器人服务实例
+            bot_service = FeishuBotService(app_id, app_secret)
+            
+            # 构建搜索模式确认卡片
+            card_content = self._build_search_mode_confirmation_card(search_mode, app_name)
+            
+            # 发送卡片消息给用户
+            success = await bot_service.send_card_message(
+                receive_id=user_id,
+                card_content=card_content,
+                receive_id_type="user_id"
+            )
+            
+            if success:
+                logger.info(f"搜索模式确认卡片发送成功: user_id={user_id}, mode={search_mode}")
+            else:
+                logger.warning(f"搜索模式确认卡片发送失败: user_id={user_id}, mode={search_mode}")
+                
+        except Exception as e:
+            logger.error(f"发送搜索模式确认消息失败: {str(e)}")
+            import traceback
+            logger.error(f"错误详情: {traceback.format_exc()}")
+
+    def _build_search_mode_confirmation_card(self, search_mode: str, app_name: str = None) -> dict:
+        """构建搜索模式确认卡片
+        
+        Args:
+            search_mode: 搜索模式
+            app_name: 应用名称
+            
+        Returns:
+            dict: 飞书卡片内容
+        """
+        # 获取当前时间
+        from datetime import datetime
+        current_time = datetime.now().strftime("%H:%M")
+        
+        # 构建应用显示名称
+        if app_name:
+            app_display = app_name
+        else:
+            app_display = "AI助手"
+        
+        # 搜索模式映射
+        mode_info = {
+            "dataset": {
+                "name": "📚 知识库搜索",
+                "desc": "仅在已有知识库中搜索相关信息",
+                "color": "blue"
+            },
+            "web": {
+                "name": "🌐 联网搜索", 
+                "desc": "实时联网获取最新信息",
+                "color": "green"
+            },
+            "all": {
+                "name": "♾️ 知识库+联网搜索",
+                "desc": "结合知识库和联网搜索，提供全面的信息",
+                "color": "purple"
+            }
+        }
+        
+        mode_data = mode_info.get(search_mode, mode_info["dataset"])
+        
+        # 构建Markdown内容
+        markdown_content = f"""---
+
+**✅ 搜索模式已设置** `{current_time}`
+
+**{mode_data['name']}**
+
+{mode_data['desc']}
+
+---
+
+现在您可以开始提问，我将使用此搜索模式为您提供答案！"""
+        
+        # 构建卡片结构
+        card_content = {
+            "schema": "2.0",
+            "header": {
+                "title": {
+                    "content": f"⚙️ 搜索设置",
+                    "tag": "plain_text"
+                },
+                "template": mode_data["color"]
+            },
+            "config": {
+                "enable_forward": True,
+                "width_mode": "fill"
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": markdown_content
+                    }
+                ]
+            }
+        }
+        
+        return card_content

@@ -56,23 +56,15 @@
               <div class="app-actions">
                 <el-button
                   size="small"
-                  type="primary"
-                  @click="restartApp(app)"
-                  :loading="restarting[app.app_id]"
-                  :disabled="app.status === 'running'"
+                  type="success"
+                  :icon="Key"
+                  @click="getToken(app)"
+                  :loading="tokenLoading[app.app_id]"
                 >
-                  重启应用
-                </el-button>
-                <el-button
-                  v-if="app.port && app.status === 'running'"
-                  size="small"
-                  type="info"
-                  @click="testConnection(app)"
-                  :loading="testing[app.app_id]"
-                >
-                  测试连接
+                  获取Token
                 </el-button>
               </div>
+
             </div>
           </el-card>
         </div>
@@ -136,14 +128,13 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
-import { Refresh, CircleCheck, CircleClose } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Refresh, CircleCheck, CircleClose, Key } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const appStatus = ref({})
 const loading = ref(false)
-const restarting = ref({})
-const testing = ref({})
+const tokenLoading = ref({})
 
 // 计算属性
 const stoppedCount = computed(() => {
@@ -174,46 +165,6 @@ const refreshStatus = () => {
   fetchAppStatus()
 }
 
-// 重启应用
-const restartApp = async (app) => {
-  restarting.value[app.app_id] = true
-  try {
-    const response = await axios.post('/api/v1/multi-app/restart', {
-      app_id: app.app_id
-    })
-    if (response.data.code === 0) {
-      ElMessage.success(`${app.app_name} 重启成功`)
-      await fetchAppStatus()
-    } else {
-      ElMessage.error('重启失败: ' + response.data.msg)
-    }
-  } catch (error) {
-    ElMessage.error('重启请求失败')
-  } finally {
-    restarting.value[app.app_id] = false
-  }
-}
-
-// 测试连接
-const testConnection = async (app) => {
-  testing.value[app.app_id] = true
-  try {
-    const response = await axios.get(`http://localhost:${app.port}/api/v1/test/ping`, {
-      timeout: 5000
-    })
-    
-    if (response.status === 200) {
-      ElMessage.success(`${app.app_name} (端口${app.port}) 连接正常`)
-    } else {
-      ElMessage.warning(`${app.app_name} 连接异常`)
-    }
-  } catch (error) {
-    ElMessage.error(`${app.app_name} 连接失败`)
-  } finally {
-    testing.value[app.app_id] = false
-  }
-}
-
 // 获取状态类型
 const getStatusType = (status) => {
   const typeMap = {
@@ -237,6 +188,47 @@ const getStatusText = (status) => {
 // 获取卡片样式
 const getCardClass = (status) => {
   return `status-${status}`
+}
+
+// 获取Token
+const getToken = async (app) => {
+  tokenLoading.value[app.app_id] = true
+  try {
+    const response = await axios.get(`/api/v1/test/token/${app.app_id}`)
+    if (response.data.token) {
+      // 停止loading状态
+      tokenLoading.value[app.app_id] = false
+      
+      // 显示token弹窗
+      try {
+        await ElMessageBox.alert(
+          `<div style="word-break: break-all; font-family: monospace; background: #f5f5f5; padding: 10px; border-radius: 4px; margin: 10px 0;">${response.data.token}</div>`,
+          `${app.app_name} 的 Access Token`,
+          {
+            dangerouslyUseHTMLString: true,
+            confirmButtonText: '复制到剪贴板',
+            callback: async () => {
+              try {
+                await navigator.clipboard.writeText(response.data.token)
+                ElMessage.success('Token已复制到剪贴板')
+              } catch (error) {
+                ElMessage.error('复制失败，请手动复制')
+              }
+            }
+          }
+        )
+      } catch (error) {
+        // 用户取消弹窗或其他错误，不需要处理
+      }
+    } else {
+      ElMessage.error('获取Token失败: 响应中没有token')
+    }
+  } catch (error) {
+    console.error('获取Token失败:', error)
+    ElMessage.error('获取Token失败: ' + (error.response?.data?.detail || error.message))
+  } finally {
+    tokenLoading.value[app.app_id] = false
+  }
 }
 
 onMounted(() => {
@@ -310,8 +302,10 @@ onMounted(() => {
 }
 
 .app-actions {
-  display: flex;
-  gap: 10px;
+  margin-top: 15px;
+  padding-top: 10px;
+  border-top: 1px solid #f0f0f0;
+  text-align: left;
 }
 
 .no-apps {

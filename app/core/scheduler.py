@@ -68,11 +68,9 @@ class SubscriptionScheduler:
             logger.info("调度器已经在运行中")
             return
         
-        # 只在单应用模式下启动定时任务
-        if not self.single_app_mode or not self.target_app:
-            logger.warning("非单应用模式或应用配置缺失，调度器将启动但不会执行任何任务")
-            self._scheduler.start()
-            self._running = True
+        # 检查是否有有效的目标应用
+        if not self.target_app:
+            logger.info("主进程，跳过调度器启动")
             return
         
         # 检查当前应用的dataset_sync配置

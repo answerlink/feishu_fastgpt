@@ -103,8 +103,7 @@ drive:write        # 写入云盘文件（可选）
 {
     "summary_llm_api_url": "https://api.siliconflow.cn/v1/chat/completions", // 摘要生成API
     "summary_llm_api_key": "sk-xxxxx",                                       // 摘要生成API密钥
-    "summary_llm_model": "Qwen/Qwen3-32B",                                  // 摘要生成模型
-    "summary_llm_model_prompt": "请给这个文件夹添加一段简洁易懂的描述，让用户可以快速了解这个文件夹的内容。不要做额外解释说明。"
+    "summary_llm_model": "Qwen/Qwen3-32B"                                  // 摘要生成模型
 }
 ```
 

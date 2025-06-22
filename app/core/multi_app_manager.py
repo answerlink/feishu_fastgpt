@@ -138,50 +138,7 @@ class MultiAppManager:
         self.running = False
         logger.info("所有应用进程已停止")
     
-    def restart_app(self, app_id: str):
-        """重启指定应用的进程"""
-        app_config = next((app for app in settings.FEISHU_APPS if app.app_id == app_id), None)
-        if not app_config:
-            logger.error(f"未找到应用配置: {app_id}")
-            return False
-        
-        # 停止旧进程
-        if app_id in self.processes:
-            process = self.processes[app_id]
-            if process.poll() is None:
-                old_port = self.app_ports.get(app_id, "未知")
-                logger.info(f"正在停止应用进程: {app_id}, 端口: {old_port}")
-                
-                # 发送停止信号
-                if os.name == 'nt':  # Windows
-                    process.terminate()
-                else:  # Unix/Linux - 杀死整个进程组
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                    except (OSError, ProcessLookupError):
-                        process.terminate()
-                
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    # 强制杀死
-                    if os.name == 'nt':  # Windows
-                        process.kill()
-                    else:  # Unix/Linux - 强制杀死整个进程组
-                        try:
-                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                        except (OSError, ProcessLookupError):
-                            process.kill()
-            
-            del self.processes[app_id]
-        
-        # 清理旧端口记录
-        if app_id in self.app_ports:
-            del self.app_ports[app_id]
-        
-        # 启动新进程（会自动分配新端口）
-        self.start_app_process(app_id, app_config.app_name, os.getcwd())
-        return True
+
     
     def get_status(self) -> Dict:
         """获取所有应用进程的状态"""

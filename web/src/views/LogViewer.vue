@@ -23,8 +23,8 @@
               placeholder="搜索关键词"
               style="width: 200px; margin-right: 10px;"
               clearable
-              @clear="fetchLogs"
-              @keyup.enter="fetchLogs"
+              @clear="handleSearch"
+              @keyup.enter="handleSearch"
             />
             <el-button
               type="primary"
@@ -52,6 +52,18 @@
           <div class="log-info">
             <span>共 {{ totalLogs }} 条日志</span>
             <span v-if="searchKeyword">，搜索：{{ searchKeyword }}</span>
+            <span>，每页 {{ pageSize }} 条</span>
+          </div>
+          <div class="pagination-container">
+            <el-pagination
+              v-model:current-page="currentPage"
+              v-model:page-size="pageSize"
+              :page-sizes="[1000, 2000]"
+              :total="totalLogs"
+              layout="total, sizes, prev, pager, next, jumper"
+              @size-change="handleSizeChange"
+              @current-change="handleCurrentChange"
+            />
           </div>
           <div class="log-actions">
             <el-button size="small" @click="downloadLogs">下载日志</el-button>
@@ -77,8 +89,14 @@ const loading = ref(false)
 const totalLogs = ref(0)
 const searchKeyword = ref('')
 
+// 分页相关
+const currentPage = ref(1)
+const pageSize = ref(1000)
+const totalPages = ref(0)
+
 // 监听日志类型变化
 watch(selectedLogType, () => {
+  currentPage.value = 1  // 重置到第一页
   fetchLogs()
 })
 
@@ -112,7 +130,8 @@ const fetchLogs = async () => {
   try {
     const params = {
       type: selectedLogType.value,
-      lines: 1000
+      page: currentPage.value,
+      page_size: pageSize.value
     }
     
     // 如果有搜索关键词，添加到参数中
@@ -126,6 +145,7 @@ const fetchLogs = async () => {
     
     logs.value = response.data.logs
     totalLogs.value = response.data.total
+    totalPages.value = response.data.total_pages
     
     if (logs.value.length === 0 && totalLogs.value === 0) {
       if (searchKeyword.value) {
@@ -139,13 +159,33 @@ const fetchLogs = async () => {
     ElMessage.error('获取日志失败: ' + (error.response?.data?.detail || error.message))
     logs.value = []
     totalLogs.value = 0
+    totalPages.value = 0
   } finally {
     loading.value = false
   }
 }
 
+// 处理搜索
+const handleSearch = () => {
+  currentPage.value = 1  // 重置到第一页
+  fetchLogs()
+}
+
 // 刷新日志
 const refreshLogs = () => {
+  fetchLogs()
+}
+
+// 处理页码变化
+const handleCurrentChange = (page) => {
+  currentPage.value = page
+  fetchLogs()
+}
+
+// 处理每页大小变化
+const handleSizeChange = (size) => {
+  pageSize.value = size
+  currentPage.value = 1  // 重置到第一页
   fetchLogs()
 }
 
@@ -208,6 +248,7 @@ const clearLogs = async () => {
     })
     
     ElMessage.success(response.data.message || '日志已清空')
+    currentPage.value = 1  // 重置到第一页
     fetchLogs()
   } catch (error) {
     if (error !== 'cancel') {
@@ -301,6 +342,8 @@ onMounted(async () => {
   justify-content: space-between;
   align-items: center;
   margin-top: 10px;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .log-info {
@@ -308,10 +351,33 @@ onMounted(async () => {
   gap: 10px;
   color: #666;
   font-size: 14px;
+  flex-wrap: wrap;
+}
+
+.pagination-container {
+  flex: 1;
+  display: flex;
+  justify-content: center;
 }
 
 .log-actions {
   display: flex;
   gap: 10px;
+}
+
+@media (max-width: 768px) {
+  .log-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .pagination-container {
+    order: 2;
+  }
+  
+  .log-actions {
+    order: 3;
+    justify-content: center;
+  }
 }
 </style> 

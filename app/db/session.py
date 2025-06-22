@@ -11,7 +11,16 @@ engine = create_async_engine(
     pool_size=settings.SQLALCHEMY_POOL_SIZE,
     pool_timeout=settings.SQLALCHEMY_POOL_TIMEOUT,
     pool_recycle=settings.SQLALCHEMY_POOL_RECYCLE,
-    pool_pre_ping=True
+    pool_pre_ping=False,  # 关闭预ping避免异步问题
+    pool_reset_on_return='commit',  # 连接返回时重置状态
+    # 添加连接清理配置
+    max_overflow=0,  # 禁用溢出连接
+    connect_args={
+        "autocommit": False,
+        "charset": "utf8mb4",
+        # 添加连接超时设置
+        "connect_timeout": 10,
+    }
 )
 
 # 创建异步会话工厂

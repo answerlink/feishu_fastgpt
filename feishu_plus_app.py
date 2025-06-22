@@ -13,13 +13,14 @@ import os
 from app.api.v1.endpoints.main_frontend import router as main_frontend_router
 
 # 导入所有模型，确保它们被注册到Base.metadata中
-from app.models import feishu_token, doc_subscription, space_subscription
+from app.models import feishu_token, doc_subscription, space_subscription, user_chat_session, user_search_preference, user_memory
 
 # 创建临时目录和静态文件目录
 os.makedirs(os.path.join(os.getcwd(), "temp"), exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "temp", "images"), exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "static"), exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "static", "images"), exist_ok=True)
+os.makedirs(os.path.join(os.getcwd(), "static", "files"), exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

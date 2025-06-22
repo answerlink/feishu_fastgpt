@@ -583,8 +583,7 @@ class FastGPTService:
             if not all([
                 self.app_config.summary_llm_api_url,
                 self.app_config.summary_llm_api_key,
-                self.app_config.summary_llm_model,
-                self.app_config.summary_llm_model_prompt
+                self.app_config.summary_llm_model
             ]):
                 logger.info(f"摘要LLM配置不完整，跳过dataset描述生成: dataset_id={dataset_id}")
                 return {
@@ -622,7 +621,7 @@ class FastGPTService:
             
             # 调用摘要LLM生成描述
             description = await self.call_summary_llm(
-                self.app_config.summary_llm_model_prompt,
+                "请直接给这个文件夹添加一段简洁易懂的描述，让用户可以快速了解这个文件夹的内容。不要做额外解释说明。",
                 filenames
             )
             

@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.logger import setup_app_logger
 
 # 导入所有模型
-from app.models import feishu_token, doc_subscription, space_subscription
+from app.models import feishu_token, doc_subscription, space_subscription, user_chat_session, user_search_preference
 
 # 获取环境变量中指定的app_id
 TARGET_APP_ID = os.environ.get('FEISHU_SINGLE_APP_ID')
@@ -67,6 +67,7 @@ os.makedirs(os.path.join(os.getcwd(), "temp"), exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "temp", "images"), exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "static"), exist_ok=True)
 os.makedirs(os.path.join(os.getcwd(), "static", "images"), exist_ok=True)
+os.makedirs(os.path.join(os.getcwd(), "static", "files"), exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import test, wiki, document, scheduler, logs, static, multi_app
+from app.api.v1.endpoints import test, wiki, document, scheduler, logs, static, multi_app, fastgpt_cleaner, fastgpt_dataset_updater, group_chat_stats, user_memory
 
 api_router = APIRouter()
 
@@ -23,6 +23,18 @@ api_router.include_router(static.router, prefix="/static", tags=["static"])
 
 # 注册多应用管理路由
 api_router.include_router(multi_app.router, prefix="/multi-app", tags=["multi-app"])
+
+# 注册FastGPT清理工具路由
+api_router.include_router(fastgpt_cleaner.router, prefix="/fastgpt-cleaner", tags=["fastgpt-cleaner"])
+
+# 注册FastGPT知识库描述更新工具路由
+api_router.include_router(fastgpt_dataset_updater.router, prefix="/fastgpt-dataset-updater", tags=["fastgpt-dataset-updater"])
+
+# 注册群聊统计信息路由
+api_router.include_router(group_chat_stats.router, prefix="/group-chat", tags=["group-chat"])
+
+# 注册用户记忆管理路由
+api_router.include_router(user_memory.router, prefix="/user-memory", tags=["user-memory"])
 
 # 在这里导入和注册其他路由
 # from .endpoints import auth

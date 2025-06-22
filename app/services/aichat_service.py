@@ -1,7 +1,7 @@
 import json
 import aiohttp
 import asyncio
-from typing import Dict, Any, Optional, AsyncGenerator
+from typing import Dict, Any, List
 from app.core.logger import setup_logger
 import time
 
@@ -22,18 +22,19 @@ class AIChatService:
             self._client = aiohttp.ClientSession()
         return self._client
     
-    async def chat_completion_streaming_enhanced(self, message: str, variables: Dict[str, Any] = None, chat_id: str = None,
+    async def chat_completion_streaming(self, message: List[Dict[str, Any]], variables: Dict[str, Any] = None, chat_id: str = None,
                                                on_status_callback=None, on_think_callback=None, on_answer_callback=None,
-                                               on_references_callback=None) -> str:
-        """调用AI Chat接口获取回复（增强版，支持状态、思考和答案的分离回调）
+                                               on_references_callback=None, should_stop_callback=None) -> str:
+        """调用AI Chat接口获取回复（支持状态、思考和答案的分离回调，支持多模态）
         
         Args:
-            message: 用户消息
+            message: 用户消息（多模态内容）
             variables: 额外变量，默认包含token
             on_status_callback: 状态更新回调函数，接收(status_text)参数
             on_think_callback: 思考过程回调函数，接收(think_text)参数
             on_answer_callback: 答案回调函数，接收(answer_text)参数
             on_references_callback: 引用数据回调函数，接收(references_data)参数
+            should_stop_callback: 停止检查回调函数，返回True表示应该停止处理
             
         Returns:
             str: AI回复内容
@@ -56,8 +57,6 @@ class AIChatService:
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
-            
-            logger.info(f"调用AI Chat接口（增强流式回调）: {message[:50]}...")
             
             # 发送请求并处理流式响应
             think_content = ""
@@ -91,6 +90,11 @@ class AIChatService:
                     # 处理流式响应
                     current_event = None
                     async for line in response.content:
+                        # 检查是否需要停止
+                        if should_stop_callback and should_stop_callback():
+                            logger.info("检测到停止信号，终止AI流式处理")
+                            break
+                        
                         line_text = line.decode('utf-8').strip()
                         
                         if not line_text:

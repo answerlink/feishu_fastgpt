@@ -135,8 +135,8 @@ class ImageBed:
             # URL格式: /api/v1/documents/None/image/VB8EbvcnRoWeAbxjg4bcTki5n1c/download
             token_match = re.search(r'/image/([^/]+)/download', original_url)
             if not token_match:
-                logger.warning(f"无法从URL中提取图片token: {original_url}")
-                return match.group(0)  # 返回原始内容
+                logger.warning(f"无法从URL中提取图片token，清空图片链接避免飞书安全错误: {original_url}")
+                return f"![]()"  # 清空图片URL，避免飞书外链安全错误
             
             image_token = token_match.group(1)
             
@@ -146,8 +146,8 @@ class ImageBed:
                 # 返回新的图片链接，描述为空
                 return f"![]({new_url})"
             else:
-                logger.warning(f"未找到图片token的映射: {image_token}")
-                return f"![]({original_url})"  # 保留原始URL但清空描述
+                logger.warning(f"未找到图片token的映射，清空图片链接避免飞书安全错误: {image_token}")
+                return f"![]()"  # 清空图片URL，避免飞书外链安全错误
         
         # 匹配Markdown图片格式: ![描述](URL)
         pattern = r'!\[([^\]]*)\]\(([^)]+)\)'

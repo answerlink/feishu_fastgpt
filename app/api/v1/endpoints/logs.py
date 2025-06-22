@@ -19,6 +19,9 @@ MAIN_LOG_FILE = "feishu-plus.log"
 class LogsResponse(BaseModel):
     logs: List[str]
     total: int
+    page: int
+    page_size: int
+    total_pages: int
 
 class LogTypesResponse(BaseModel):
     """日志类型响应"""
@@ -45,7 +48,8 @@ async def get_log_types():
 @router.get("/", response_model=LogsResponse)
 async def get_logs(
     type: str = Query("all", description="日志类型：all(全部), error(错误), app_{app_id}(应用专用)"),
-    lines: int = Query(1000, description="返回行数，默认1000行"),
+    page: int = Query(1, description="页码，从1开始"),
+    page_size: int = Query(1000, description="每页行数，默认1000行"),
     search: str = Query(None, description="搜索关键词")
 ):
     """获取日志内容"""
@@ -76,11 +80,31 @@ async def get_logs(
         raise HTTPException(status_code=400, detail=f"不支持的日志类型: {type}")
     
     if not log_file_path.exists():
-        return LogsResponse(logs=[], total=0)
+        return LogsResponse(logs=[], total=0, page=page, page_size=page_size, total_pages=0)
     
     try:
-        with open(log_file_path, "r", encoding="utf-8") as f:
-            all_lines = f.readlines()
+        # 尝试多种编码方式读取文件
+        encodings = ['utf-8', 'gbk', 'gb2312', 'latin1']
+        all_lines = None
+        
+        for encoding in encodings:
+            try:
+                with open(log_file_path, "r", encoding=encoding, errors='ignore') as f:
+                    all_lines = f.readlines()
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        if all_lines is None:
+            # 如果所有编码都失败，使用二进制模式读取并忽略错误
+            with open(log_file_path, "rb") as f:
+                content = f.read()
+                # 尝试解码，忽略无法解码的字符
+                try:
+                    text_content = content.decode('utf-8', errors='ignore')
+                except:
+                    text_content = content.decode('latin1', errors='ignore')
+                all_lines = text_content.splitlines(keepends=True)
         
         # 过滤日志
         if type == "error":
@@ -93,13 +117,45 @@ async def get_logs(
         if search:
             filtered_lines = [line for line in filtered_lines if search.lower() in line.lower()]
         
-        # 取最后N行
-        result_lines = filtered_lines[-lines:] if len(filtered_lines) > lines else filtered_lines
+        # 计算总数和分页
+        total_lines = len(filtered_lines)
+        total_pages = (total_lines + page_size - 1) // page_size if total_lines > 0 else 0
         
-        # 清理换行符
-        result_lines = [line.rstrip('\n\r') for line in result_lines]
+        # 确保页码有效
+        if page < 1:
+            page = 1
+        elif page > total_pages and total_pages > 0:
+            page = total_pages
         
-        return LogsResponse(logs=result_lines, total=len(result_lines))
+        # 计算分页范围（从最新的日志开始，即文件末尾）
+        start_index = max(0, total_lines - page * page_size)
+        end_index = max(0, total_lines - (page - 1) * page_size)
+        
+        # 获取当前页的日志（倒序，最新的在前）
+        page_lines = filtered_lines[start_index:end_index]
+        page_lines.reverse()  # 反转，让最新的日志在前面
+        
+        # 清理换行符并确保所有行都是有效的字符串
+        result_lines = []
+        for line in page_lines:
+            try:
+                # 清理换行符
+                clean_line = line.rstrip('\n\r')
+                # 确保是有效的UTF-8字符串
+                clean_line.encode('utf-8')
+                result_lines.append(clean_line)
+            except UnicodeEncodeError:
+                # 如果仍然有编码问题，替换问题字符
+                clean_line = line.rstrip('\n\r').encode('utf-8', errors='replace').decode('utf-8')
+                result_lines.append(clean_line)
+        
+        return LogsResponse(
+            logs=result_lines, 
+            total=total_lines, 
+            page=page, 
+            page_size=page_size, 
+            total_pages=total_pages
+        )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取日志文件失败: {str(e)}")
@@ -142,15 +198,40 @@ async def download_logs(type: str = Query("all", description="日志类型")):
     
     try:
         def generate_log_content():
-            with open(log_file_path, "r", encoding="utf-8") as f:
+            # 尝试多种编码方式读取文件
+            encodings = ['utf-8', 'gbk', 'gb2312', 'latin1']
+            
+            for encoding in encodings:
+                try:
+                    with open(log_file_path, "r", encoding=encoding, errors='ignore') as f:
+                        if type == "error":
+                            # 只输出错误日志
+                            for line in f:
+                                if "[ERROR]" in line or "[CRITICAL]" in line:
+                                    yield line
+                        else:
+                            # 输出全部日志
+                            for line in f:
+                                yield line
+                    return
+                except UnicodeDecodeError:
+                    continue
+            
+            # 如果所有编码都失败，使用二进制模式
+            with open(log_file_path, "rb") as f:
+                content = f.read()
+                try:
+                    text_content = content.decode('utf-8', errors='ignore')
+                except:
+                    text_content = content.decode('latin1', errors='ignore')
+                
+                lines = text_content.splitlines(keepends=True)
                 if type == "error":
-                    # 只输出错误日志
-                    for line in f:
+                    for line in lines:
                         if "[ERROR]" in line or "[CRITICAL]" in line:
                             yield line
                 else:
-                    # 输出全部日志
-                    for line in f:
+                    for line in lines:
                         yield line
         
         return StreamingResponse(
@@ -196,7 +277,7 @@ async def clear_logs(type: str = Query("all", description="日志类型")):
     
     try:
         # 清空文件内容
-        with open(log_file_path, "w", encoding="utf-8") as f:
+        with open(log_file_path, "w", encoding="utf-8", errors='ignore') as f:
             f.write("")
         
         if type == "all":

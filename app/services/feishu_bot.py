@@ -6,10 +6,13 @@ import re
 import os
 import tempfile
 import shutil
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from app.core.config import settings
 from app.core.logger import setup_logger, setup_app_logger
 from app.services.aichat_service import AIChatService
+from app.utils.asr_service import ASRService
+from app.services.chat_message_service import chat_message_service
+from app.services.user_memory_service import UserMemoryService
 
 # 检查是否在单应用模式
 single_app_mode = os.environ.get('FEISHU_SINGLE_APP_MODE', 'false').lower() == 'true'
@@ -34,6 +37,9 @@ else:
 
 class FeishuBotService:
     """飞书机器人服务"""
+    
+    # 类级别的停止标志存储，所有实例共享
+    _class_stop_flags = {}
     
     def __init__(self, app_id: str, app_secret: str):
         self.app_id = app_id
@@ -60,6 +66,28 @@ class FeishuBotService:
                 logger.warning("AI Chat配置不完整，将使用默认回复")
         else:
             logger.info("AI Chat功能未启用，将使用默认回复")
+        
+        # 初始化ASR服务
+        self.asr_service = None
+        if self.app_config and hasattr(self.app_config, 'asr_api_url'):
+            asr_api_url = getattr(self.app_config, 'asr_api_url', None)
+            asr_api_key = getattr(self.app_config, 'asr_api_key', None)
+            if asr_api_url:
+                self.asr_service = ASRService(asr_api_url, asr_api_key)
+                logger.info(f"启用ASR服务: {asr_api_url}")
+                if asr_api_key:
+                    logger.info("ASR API认证已配置")
+            else:
+                logger.info("ASR配置不完整，将跳过语音转文字")
+        else:
+            logger.info("ASR功能未配置，将跳过语音转文字")
+        
+        # 初始化群聊数据库服务
+        self.chat_message_service = chat_message_service
+        
+        # 初始化用户记忆服务
+        self.user_memory_service = UserMemoryService()
+        logger.info("用户记忆服务已初始化")
     
     async def get_tenant_access_token(self) -> str:
         """获取tenant_access_token（简化版，专门用于机器人）"""
@@ -76,6 +104,111 @@ class FeishuBotService:
                 if result.get("code") != 0:
                     raise Exception(f"获取tenant_access_token失败: {result}")
                 return result["tenant_access_token"]
+    
+
+    
+    def process_mentions_and_check_bot(self, message_content: Dict[str, Any]) -> tuple[str, str, bool]:
+        """处理消息中的mentions并检查是否@了机器人
+        
+        Args:
+            message_content: 消息内容
+            
+        Returns:
+            tuple: (raw_content, pure_content, mentioned_bot)
+                - raw_content: 替换@_user_x为真实姓名后的内容
+                - pure_content: 去除所有@信息后的纯净内容
+                - mentioned_bot: 是否@了机器人
+        """
+        try:
+            content = message_content.get("content", "{}")
+            message_type = message_content.get("message_type", "text")
+            mentions = message_content.get("mentions", [])
+
+            if message_type != "text":
+                return content, content, False
+            
+            # 解析文本内容
+            try:
+                text_content = json.loads(content).get("text", "")
+            except:
+                text_content = content
+            
+            raw_content = text_content
+            pure_content = text_content
+            mentioned_bot = False
+            
+            # 获取机器人名称（使用app_name）
+            app_name = getattr(self.app_config, 'app_name', 'AI助手') if self.app_config else 'AI助手'
+            
+            # 处理mentions
+            if mentions:
+                for mention in mentions:
+                    key = mention.get("key", "")  # 例如: @_user_1
+                    name = mention.get("name", "")  # 例如: 徐枫
+                    
+                    if key and name:
+                        # 检查key是否在内容中
+                        if key in raw_content:
+                            # 将raw_content中的@_user_x替换为@真实姓名
+                            old_raw = raw_content
+                            raw_content = raw_content.replace(key, f"@{name}")
+                        
+                        # 检查是否@了机器人（通过姓名匹配）
+                        if name == app_name:
+                            mentioned_bot = True
+                            logger.info(f"检测到@机器人: {name}")
+                        else:
+                            logger.debug(f"@的是其他用户: '{name}' != '{app_name}'")
+                        
+                        # 从pure_content中移除@信息（包括空格）
+                        if key in pure_content:
+                            old_pure = pure_content
+                            pure_content = pure_content.replace(key, "").strip()
+                            # 如果有多个连续空格，替换为单个空格
+                            import re
+                            pure_content = re.sub(r'\s+', ' ', pure_content).strip()
+            
+            # 如果没有通过mentions检测到@机器人，再检查文本内容中是否直接包含@机器人名称
+            if not mentioned_bot and f"@{app_name}" in raw_content:
+                mentioned_bot = True
+                logger.info(f"在文本内容中检测到@机器人: @{app_name}")
+            
+            logger.debug(f"消息处理结果 - 原始: '{text_content}' -> raw: '{raw_content}' -> pure: '{pure_content}' -> @bot: {mentioned_bot}")
+            
+            return raw_content, pure_content, mentioned_bot
+            
+        except Exception as e:
+            logger.error(f"处理mentions异常: {str(e)}")
+            # 出错时返回原内容
+            try:
+                text_content = json.loads(content).get("text", "")
+            except:
+                text_content = content
+            return text_content, text_content, False
+    
+    def extract_mention_users(self, message_content: Dict[str, Any]) -> List[str]:
+        """提取消息中@的所有用户名称
+        
+        Args:
+            message_content: 消息内容
+            
+        Returns:
+            List[str]: 被@的用户名称列表
+        """
+        try:
+            mentions = message_content.get("mentions", [])
+            mention_users = []
+            
+            for mention in mentions:
+                name = mention.get("name", "")
+                if name:
+                    mention_users.append(name)
+            
+            return mention_users
+            
+        except Exception as e:
+            logger.error(f"提取@用户列表异常: {str(e)}")
+            return []
     
     async def handle_message(self, event_data: Dict[str, Any]) -> bool:
         """处理接收到的消息"""
@@ -94,30 +227,254 @@ class FeishuBotService:
             message_type = message_content.get("message_type", "text")
             chat_id = message_content.get("chat_id")
             chat_type = message_content.get("chat_type")
+            message_id = message_content.get("message_id")
             
             logger.info(f"处理消息 - 发送者: {sender_id}, 类型: {message_type}, 聊天: {chat_id} ({chat_type})")
             
+            # 获取发送者信息用于消息记录
+            user_info = await self.get_user_info(sender_id)
+            sender_name = user_info.get("name", "未知用户")
+            
+            # 获取配置项
+            p2p_reply_enabled = getattr(self.app_config, 'aichat_reply_p2p', True)
+            group_reply_enabled = getattr(self.app_config, 'aichat_reply_group', False)
+            
+            # 群聊消息记录（根据配置决定是否记录）
+            mentioned_bot = False  # 初始化默认值
+            if chat_type == "group" and group_reply_enabled:
+                try:
+                    # 处理mentions并检查是否@机器人
+                    raw_content, pure_content, mentioned_bot = self.process_mentions_and_check_bot(message_content)
+                    
+                    # 提取@的用户列表
+                    mention_users = self.extract_mention_users(message_content)
+                    
+                    # 获取群聊信息
+                    chat_info = await self.get_chat_info(chat_id)
+                    chat_name = chat_info.get("name", "未知群聊")
+                    
+                    # 解析消息内容用于记录
+                    if message_type == "text":
+                        display_raw_content = raw_content
+                        display_pure_content = pure_content
+                    elif message_type == "image":
+                        display_raw_content = "[图片]"
+                        display_pure_content = "[图片]"
+                    elif message_type == "file":
+                        display_raw_content = "[文件]"
+                        display_pure_content = "[文件]"
+                    elif message_type == "audio":
+                        display_raw_content = "[语音]"
+                        display_pure_content = "[语音]"
+                    elif message_type == "post":
+                        display_raw_content = "[富文本]"
+                        display_pure_content = "[富文本]"
+                    else:
+                        display_raw_content = f"[{message_type}]"
+                        display_pure_content = f"[{message_type}]"
+                    
+                    # 创建消息数据并保存到数据库
+                    message_data = {
+                        "app_id": self.app_id,
+                        "message_id": message_id,
+                        "chat_type": "group",
+                        "chat_id": chat_id,
+                        "chat_name": chat_name,
+                        "sender_id": sender_id,
+                        "sender_name": sender_name,
+                        "raw_content": display_raw_content,
+                        "pure_content": display_pure_content,
+                        "message_type": message_type,
+                        "mention_users": mention_users,
+                        "mentioned_bot": mentioned_bot,
+                    }
+                    
+                    # 保存群聊消息到数据库
+                    save_success = await self.chat_message_service.save_message(message_data)
+                    
+                    if not save_success:
+                        logger.error(f"记录群聊消息失败: 数据库保存失败")
+                        return False
+                    
+                except Exception as e:
+                    logger.error(f"记录群聊消息失败: {str(e)}")
+                    # 如果上面的逻辑失败，使用默认值
+                    mentioned_bot = False
+            
+            # 处理私聊消息记录（根据配置决定是否记录）
+            if chat_type == "p2p" and p2p_reply_enabled:
+                try:
+                    # 解析消息内容用于记录
+                    if message_type == "text":
+                        display_raw_content = content.strip('"')  # 去除JSON字符串的引号
+                        # 解析JSON获取纯文本内容
+                        try:
+                            text_data = json.loads(display_raw_content)
+                            display_pure_content = text_data.get("text", display_raw_content)
+                        except (json.JSONDecodeError, AttributeError):
+                            display_pure_content = display_raw_content
+                    elif message_type == "image":
+                        display_raw_content = "[图片]"
+                        display_pure_content = "[图片]"
+                    elif message_type == "file":
+                        display_raw_content = "[文件]"
+                        display_pure_content = "[文件]"
+                    elif message_type == "audio":
+                        display_raw_content = "[语音]"
+                        display_pure_content = "[语音]"
+                    elif message_type == "post":
+                        display_raw_content = "[富文本]"
+                        display_pure_content = "[富文本]"
+                    else:
+                        display_raw_content = f"[{message_type}]"
+                        display_pure_content = f"[{message_type}]"
+                    
+                    # 创建私聊消息数据并保存到数据库
+                    message_data = {
+                        "app_id": self.app_id,
+                        "message_id": message_id,
+                        "chat_type": "p2p",
+                        "chat_id": chat_id,
+                        "chat_name": "",
+                        "sender_id": sender_id,
+                        "sender_name": sender_name,
+                        "raw_content": display_raw_content,
+                        "pure_content": display_pure_content,
+                        "message_type": message_type,
+                        "mention_users": [],  # 私聊没有@功能
+                        "mentioned_bot": False,  # 私聊不需要@机器人
+                    }
+                    
+                    # 保存私聊消息到数据库
+                    save_success = await self.chat_message_service.save_message(message_data)
+                    
+                    if not save_success:
+                        logger.error(f"记录私聊消息失败: 数据库保存失败")
+                    else:
+                        logger.debug(f"私聊消息已保存: {message_id}")
+                        
+                except Exception as e:
+                    logger.error(f"记录私聊消息失败: {str(e)}")
+            
             # 检查聊天类型配置，决定是否回复
             should_reply = False
+            
             if chat_type == "p2p":
-                # 单聊：检查aichat_reply_p2p配置
-                should_reply = getattr(self.app_config, 'aichat_reply_p2p', True)
+                should_reply = p2p_reply_enabled
                 logger.info(f"单聊消息，配置允许回复: {should_reply}")
+                
             elif chat_type == "group":
-                # 群聊：检查aichat_reply_group配置
-                should_reply = getattr(self.app_config, 'aichat_reply_group', False)
-                logger.info(f"群聊消息，配置允许回复: {should_reply}")
+                if not group_reply_enabled:
+                    logger.info("群聊回复功能未启用")
+                    should_reply = False
+                else:
+                    trigger_mode = getattr(self.app_config, 'aichat_reply_group_trigger_mode', 'at')
+                    if trigger_mode == "at":
+                        # at模式：只有@机器人时才回复
+                        # mentioned_bot已经在上面的群聊消息记录部分设置了
+                        should_reply = mentioned_bot
+                    elif trigger_mode == "all":
+                        # all模式：回复所有消息
+                        should_reply = True
+                    elif trigger_mode == "auto":
+                        # auto模式：自动判断（暂时未实现，默认为at模式）
+                        # mentioned_bot已经在上面的群聊消息记录部分设置了
+                        should_reply = mentioned_bot
+                        logger.info(f"自动模式@检测结果: {mentioned_bot}")
+                    else:
+                        logger.warning(f"未知的群聊触发模式: {trigger_mode}")
+                        should_reply = False
             else:
                 logger.warning(f"未知聊天类型: {chat_type}")
                 return True  # 对于未知类型，直接返回成功但不处理
             
             # 如果配置不允许回复，直接返回
             if not should_reply:
-                logger.info(f"根据配置，{chat_type}类型聊天不回复消息")
+                logger.info(f"根据配置，{chat_type}类型聊天不回复消息 (mentioned_bot: {mentioned_bot})")
                 return True
             
+            # 处理语音消息
+            if message_type == "audio":
+                try:
+                    # 解析语音消息内容
+                    audio_content = json.loads(content)
+                    file_key = audio_content.get("file_key")
+                    duration = audio_content.get("duration", 0)
+                    
+                    logger.info(f"收到语音消息: file_key={file_key}, duration={duration}ms")
+                    
+                    # 确定接收者和接收者类型
+                    receive_id = None
+                    receive_id_type = None
+                    
+                    if chat_type == "p2p":
+                        # 单聊，发送给发送者
+                        receive_id = sender_id
+                        receive_id_type = "user_id"
+                    elif chat_type == "group":
+                        # 群聊，发送到群聊
+                        receive_id = chat_id
+                        receive_id_type = "chat_id"
+                    
+                    if not receive_id:
+                        logger.error("无法确定音频消息接收者")
+                        return True  # 继续处理，不算错误
+                    
+                    # 下载语音文件
+                    if file_key:
+                        # 获取tenant_access_token
+                        token = await self.get_tenant_access_token()
+                        logger.info(f"获取到tenant_access_token: {token[:10]}...")
+                        
+                        # 构建下载URL (添加type参数，语音消息类型为audio)
+                        url = f"{self.base_url}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+                        headers = {
+                            "Authorization": f"Bearer {token}"
+                        }
+                        
+                        logger.info(f"准备下载语音文件: {url}")
+                        
+                        # 创建临时目录用于存储语音文件
+                        temp_dir = os.path.join(os.getcwd(), "temp", "audio")
+                        os.makedirs(temp_dir, exist_ok=True)
+                        logger.info(f"创建临时目录: {temp_dir}")
+                        
+                        # 下载文件
+                        async with aiohttp.ClientSession() as client:
+                            logger.info("开始下载语音文件...")
+                            async with client.get(url, headers=headers) as response:
+                                logger.info(f"下载响应状态码: {response.status}")
+                                if response.status == 200:
+                                    # 保存音频文件（opus格式）
+                                    audio_file_name = f"{file_key}.opus"
+                                    audio_file_path = os.path.join(temp_dir, audio_file_name)
+                                    
+                                    # 保存音频文件
+                                    content = await response.read()
+                                    logger.info(f"下载到文件大小: {len(content)} bytes")
+                                    
+                                    with open(audio_file_path, "wb") as f:
+                                        f.write(content)
+                                    
+                                    logger.info(f"语音文件下载成功: {audio_file_path}")
+                                    
+                                    # 直接进行语音转文字(ASR)处理
+                                    if self.asr_service:
+                                        await self._process_audio_transcription(audio_file_path, sender_id, receive_id, receive_id_type)
+                                    else:
+                                        logger.info("ASR服务未配置，跳过语音转文字")
+                                    
+                                else:
+                                    error_text = await response.text()
+                                    logger.error(f"下载语音文件失败: {response.status}, 错误信息: {error_text}")
+                    
+                except Exception as e:
+                    logger.error(f"处理语音消息失败: {str(e)}")
+                    import traceback
+                    logger.error(f"错误详情: {traceback.format_exc()}")
+            
             # 解析文本消息
-            if message_type == "text":
+            elif message_type == "text":
                 text_content = json.loads(content).get("text", "")
                 logger.info(f"收到文本消息: {text_content}")
                 
@@ -142,14 +499,197 @@ class FeishuBotService:
                 if self.aichat_service:
                     try:
                         logger.info("尝试使用流式卡片回复")
-                        await self.generate_streaming_reply(text_content, sender_id, receive_id, receive_id_type)
+                        
+                        # 构建消息内容（群聊时可能需要包含上下文）
+                        message_content_for_ai = [{"type": "text", "text": text_content}]
+                        
+                        # 如果是群聊且@了机器人，添加群聊上下文并使用pure_content
+                        if chat_type == "group" and mentioned_bot:
+                            # 使用pure_content作为真正的问题内容
+                            _, pure_text_content, _ = self.process_mentions_and_check_bot(message_content)
+                            
+                            context = await self.get_group_chat_context(self.app_id, chat_id, context_limit=2)
+                            if context:
+                                # 将上下文添加到消息前面，使用pure_content作为当前问题
+                                context_message = f"群聊上下文:\n{context}\n\n当前问题: {pure_text_content}"
+                                message_content_for_ai = [{"type": "text", "text": context_message}]
+                                logger.info(f"群聊回复包含上下文，上下文长度: {len(context)}，纯净问题: '{pure_text_content}'")
+                            else:
+                                # 没有上下文时直接使用pure_content
+                                message_content_for_ai = [{"type": "text", "text": pure_text_content}]
+                                logger.info(f"群聊回复无上下文，纯净问题: '{pure_text_content}'")
+                        
+                        await self.generate_streaming_reply(message_content_for_ai, sender_id, receive_id, receive_id_type)
                         logger.info("流式卡片回复已发送")
+                        
+                        # 调度用户记忆提取任务
+                        await self._schedule_memory_extraction(
+                            sender_id, message_content_for_ai, chat_id, chat_type, sender_name
+                        )
+                        
                         return True
                     except Exception as e:
                         logger.error(f"流式卡片回复失败，回退到普通文本回复: {str(e)}")
                         # 继续执行普通文本回复
                         self._get_default_reply(text_content)
-                
+            
+            # 处理文件消息
+            elif message_type == "file":
+                try:
+                    # 解析文件消息内容
+                    file_content = json.loads(content)
+                    file_key = file_content.get("file_key")
+                    file_name = file_content.get("file_name", "未知文件")
+                    
+                    logger.info(f"收到文件消息: file_key={file_key}, file_name={file_name}")
+                    
+                    # 确定接收者和接收者类型
+                    receive_id = None
+                    receive_id_type = None
+                    
+                    if chat_type == "p2p":
+                        # 单聊，发送给发送者
+                        receive_id = sender_id
+                        receive_id_type = "user_id"
+                    elif chat_type == "group":
+                        # 群聊，发送到群聊
+                        receive_id = chat_id
+                        receive_id_type = "chat_id"
+                    
+                    if not receive_id:
+                        logger.error("无法确定文件消息接收者")
+                        return False
+                    
+                    # 下载文件并处理
+                    if file_key:
+                        # 下载文件并获取base64数据
+                        file_info = await self._download_and_process_file(message_id, file_key, file_name)
+                        
+                        if file_info.get("success") and file_info.get("file_url"):
+                            # 构建多模态消息内容（文件格式）
+                            multimodal_content = [
+                                {
+                                    "type": "file_url",
+                                    "name": file_name,
+                                    "url": file_info["file_url"]
+                                },
+                                {
+                                    "type": "text", 
+                                    "text": "请简述这个文档内容"
+                                }
+                            ]
+                            
+                            logger.info(f"构建文件消息: 文件名='{file_name}', file_url={file_info['file_url']}")
+                            
+                            # 使用流式卡片回复
+                            if self.aichat_service:
+                                try:
+                                    logger.info("使用流式卡片回复文件消息")
+                                    await self.generate_streaming_reply(multimodal_content, sender_id, receive_id, receive_id_type)
+                                    logger.info("文件消息流式卡片回复已发送")
+                                    
+                                    # 调度用户记忆提取任务
+                                    await self._schedule_memory_extraction(
+                                        sender_id, multimodal_content, chat_id, chat_type, sender_name
+                                    )
+                                    
+                                    return True
+                                except Exception as e:
+                                    logger.error(f"文件消息流式卡片回复失败: {str(e)}")
+                                    # 发送简单文本回复
+                                    await self.send_text_message(receive_id, f"已收到文件：{file_name}，但处理失败", receive_id_type)
+                            else:
+                                # 没有AI服务时的默认回复
+                                await self.send_text_message(receive_id, f"已收到文件：{file_name}", receive_id_type)
+                        else:
+                            # 文件下载失败
+                            error_msg = file_info.get("error", "文件处理失败")
+                            logger.error(f"文件处理失败: {error_msg}")
+                            await self.send_text_message(receive_id, f"❌ 文件处理失败：{error_msg}", receive_id_type)
+                    
+                except Exception as e:
+                    logger.error(f"处理文件消息失败: {str(e)}")
+                    import traceback
+                    logger.error(f"错误详情: {traceback.format_exc()}")
+            
+            # 处理富文本消息（图片+文字）
+            elif message_type == "post":
+                try:
+                    post_content = json.loads(content)
+                    logger.info(f"收到富文本消息: {post_content}")
+                    
+                    # 解析富文本内容，提取文字和图片
+                    parsed_content = await self._parse_post_content(post_content, message_id)
+                    text_parts = parsed_content.get("text_parts", [])
+                    image_parts = parsed_content.get("image_parts", [])
+                    
+                    # 组合文字内容
+                    combined_text = " ".join(text_parts) if text_parts else ""
+                    if not combined_text:
+                        combined_text = "这是什么？"  # 默认问题
+                    
+                    # 构建多模态消息内容
+                    multimodal_content = []
+                    
+                    # 添加图片（如果有）
+                    for img_info in image_parts:
+                        if img_info.get("success") and img_info.get("base64_data"):
+                            mime_type = img_info.get("mime_type", "image/jpeg")
+                            multimodal_content.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{img_info['base64_data']}"
+                                }
+                            })
+                    
+                    # 添加文字内容
+                    multimodal_content.append({
+                        "type": "text", 
+                        "text": combined_text
+                    })
+                    
+                    logger.info(f"构建多模态消息: 文字='{combined_text}', 图片数量={len([c for c in multimodal_content if c['type'] == 'image_url'])}")
+                    
+                    # 确定接收者和接收者类型
+                    receive_id = None
+                    receive_id_type = None
+                    
+                    if chat_type == "p2p":
+                        # 单聊，发送给发送者
+                        receive_id = sender_id
+                        receive_id_type = "user_id"
+                    elif chat_type == "group":
+                        # 群聊，发送到群聊
+                        receive_id = chat_id
+                        receive_id_type = "chat_id"
+                    
+                    if not receive_id:
+                        logger.error("无法确定富文本消息接收者")
+                        return False
+                    
+                    # 使用流式卡片回复
+                    if self.aichat_service:
+                        try:
+                            logger.info("使用流式卡片回复富文本消息")
+                            await self.generate_streaming_reply(multimodal_content, sender_id, receive_id, receive_id_type)
+                            logger.info("富文本消息流式卡片回复已发送")
+                            
+                            # 调度用户记忆提取任务
+                            await self._schedule_memory_extraction(
+                                sender_id, multimodal_content, chat_id, chat_type, sender_name
+                            )
+                            
+                            return True
+                        except Exception as e:
+                            logger.error(f"富文本消息流式卡片回复失败: {str(e)}")
+                            # 发送简单文本回复
+                            await self.send_text_message(receive_id, self._get_default_reply(combined_text), receive_id_type)
+                    
+                except Exception as e:
+                    logger.error(f"处理富文本消息失败: {str(e)}")
+                    import traceback
+                    logger.error(f"错误详情: {traceback.format_exc()}")
+            
             return True
             
         except Exception as e:
@@ -157,6 +697,62 @@ class FeishuBotService:
             import traceback
             logger.error(f"错误详情: {traceback.format_exc()}")
             return False
+    
+    async def _schedule_memory_extraction(
+        self, 
+        user_id: str, 
+        message_content: List[Dict[str, Any]],
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        nickname: Optional[str] = None
+    ):
+        """调度用户记忆提取任务
+        
+        Args:
+            user_id: 用户ID
+            message_content: 消息内容
+            chat_id: 聊天ID（可选）
+        """
+        try:
+            # 检查是否启用用户记忆功能
+            memory_enabled = getattr(self.app_config, 'user_memory_enable', True) if self.app_config else True
+            
+            if not memory_enabled:
+                logger.debug("用户记忆功能未启用，跳过记忆提取")
+                return
+            
+            # 将消息内容转换为适合记忆提取的格式
+            messages_for_memory = []
+            
+            for item in message_content:
+                if item.get("type") == "text":
+                    messages_for_memory.append({
+                        "role": "user",
+                        "content": item.get("text", "")
+                    })
+                elif item.get("type") == "file_url":
+                    file_name = item.get("name", "未知文件")
+                    messages_for_memory.append({
+                        "role": "user", 
+                        "content": f"用户上传了文件：{file_name}"
+                    })
+                elif item.get("type") == "image_url":
+                    messages_for_memory.append({
+                        "role": "user",
+                        "content": "用户发送了图片"
+                    })
+            
+            if messages_for_memory:
+                # 调度记忆提取任务
+                await self.user_memory_service.schedule_memory_extraction(
+                    self.app_id, user_id, messages_for_memory, chat_id, chat_type, nickname
+                )
+                logger.info(f"已为用户 {user_id}@{self.app_id} 调度记忆提取任务")
+            else:
+                logger.debug("没有可用于记忆提取的消息内容")
+                
+        except Exception as e:
+            logger.error(f"调度记忆提取任务失败: {e}")
     
     async def get_collection_download_url(self, collection_id: str) -> Optional[str]:
         """获取collection的下载链接"""
@@ -262,253 +858,500 @@ class FeishuBotService:
                 "success": False
             }
 
-    async def generate_streaming_reply(self, user_message: str, user_id: str, receive_id: str, 
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """获取群聊详细信息
+        
+        Args:
+            chat_id: 群聊ID
+            
+        Returns:
+            Dict[str, Any]: 群聊信息
+        """
+        try:
+            token = await self.get_tenant_access_token()
+            url = f"{self.base_url}/open-apis/im/v1/chats/{chat_id}?user_id_type=open_id"
+            
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            
+            # 使用临时的客户端会话避免事件循环冲突
+            async with aiohttp.ClientSession() as client:
+                async with client.get(url, headers=headers) as response:
+                    result = await response.json()
+                    
+                    if result.get("code") == 0:
+                        chat_data = result.get("data", {})
+                        
+                        # 提取需要的字段
+                        avatar = chat_data.get("avatar", "")
+                        name = chat_data.get("name", "")
+                        description = chat_data.get("description", "")
+                        chat_mode = chat_data.get("chat_mode", "")
+                        chat_type = chat_data.get("chat_type", "")
+                        
+                        logger.info(f"获取群聊信息成功: {name} ({chat_id})")
+                        
+                        return {
+                            "chat_id": chat_id,
+                            "name": name or "未命名群聊",
+                            "description": description,
+                            "avatar": avatar,
+                            "chat_mode": chat_mode,
+                            "chat_type": chat_type,
+                            "success": True
+                        }
+                    else:
+                        logger.error(f"获取群聊信息失败: {result}")
+                        return {
+                            "chat_id": chat_id,
+                            "name": "未知群聊",
+                            "description": "",
+                            "avatar": "",
+                            "chat_mode": "",
+                            "chat_type": "",
+                            "success": False
+                        }
+                        
+        except Exception as e:
+            logger.error(f"获取群聊信息异常: {str(e)}")
+            return {
+                "chat_id": chat_id,
+                "name": "未知群聊",
+                "description": "",
+                "avatar": "",
+                "chat_mode": "",
+                "chat_type": "",
+                "success": False
+            }
+
+    async def generate_streaming_reply(self, user_message: List[Dict[str, Any]], user_id: str, receive_id: str, 
                                      receive_id_type: str = "user_id") -> str:
         """生成流式回复内容（使用卡片流式更新）"""
         try:
-            # 如果启用了AI Chat服务，使用流式卡片回复
-            if self.aichat_service:
-                logger.info(f"使用AI Chat流式服务生成回复: user_id {user_id}, {user_message[:50]}...")
-                
-                # 获取用户详细信息
-                user_info = await self.get_user_info(user_id)
-                
-                # 构建包含app_name的chat_id
-                app_name = getattr(self.app_config, 'app_name', 'default') if self.app_config else 'default'
-                
-                # 初始化当前卡片内容状态
-                current_card_state = {
-                    "user_message": user_message,
-                    "sender_name": user_info["name"],  # 使用用户真实姓名
-                    "status": "🔄 **正在准备**...",
-                    "think_title": "💭 **准备思考中...**",
-                    "think_content": "",
-                    "think_finished": False,
-                    "answer_content": "",
-                    "references_title": "📚 **知识库引用** (0)",
-                    "references_content": "",
-                    "bot_summary": "AI正在思考中...",  # 机器人问答状态
-                    "image_cache": {},  # 添加图片缓存：{原始URL: 飞书img_key}
-                    "processing_images": set()  # 添加正在处理的图片URL集合
-                }
-                
-                # 1. 创建流式卡片
-                card_content = self._build_card_content(current_card_state)
-                card_result = await self._create_card_entity(card_content)
-                
-                if card_result.get("code") != 0:
-                    logger.error(f"创建流式卡片失败: {card_result}")
-                    return
-                
-                card_id = card_result.get("data", {}).get("card_id")
-                if not card_id:
-                    logger.error("创建流式卡片成功但未获取到card_id")
-                    return
-                
-                # 2. 发送初始卡片消息
-                send_result = await self._send_card_message_by_id(receive_id, card_id, receive_id_type)
-                if send_result.get("code") != 0:
-                    logger.error(f"发送流式卡片消息失败: {send_result}")
-                    return
-                
-                logger.info(f"流式卡片已发送: card_id={card_id}")
-                
-                # 3. 流式更新卡片内容
-                sequence_counter = 1
-                sequence_lock = asyncio.Lock()  # 序列号锁，确保并发安全
-                think_title_updated = False  # 思考标题更新标志
-                answer_title_updated = False  # 答案标题更新标志
-                
-                async def on_status_callback(status_text: str):
-                    nonlocal sequence_counter, current_card_state
+            # 获取用户详细信息
+            user_info = await self.get_user_info(user_id)
+            
+            # 构建包含app_name的chat_id
+            app_name = getattr(self.app_config, 'app_name', 'default') if self.app_config else 'default'
+            
+            # 提取用户消息文本用于卡片显示
+            display_message = ""
+            for item in user_message:
+                if item.get("type") == "text":
+                    display_message = item.get("text", "")
+                    break
+                elif item.get("type") == "file_url":
+                    file_name = item.get("name", "未知文件")
+                    display_message = f"[文件: {file_name}]"
+                elif item.get("type") == "image_url":
+                    display_message = f"[图片]"
+
+            logger.info(f"使用AI Chat流式服务生成回复: user_id {user_id}, {display_message}...")
+            
+            # 检查是否启用用户记忆功能
+            memory_enabled = getattr(self.app_config, 'user_memory_enable', True) if self.app_config else True
+            user_context = ""
+            
+            if memory_enabled:
+                try:
+                    # 获取用户画像和记忆
+                    logger.info(f"为用户 {user_id} 加载记忆上下文...")
+                    profile = await self.user_memory_service.get_user_profile(self.app_id, user_id)
                     
-                    # 在锁内部分配序列号并更新时间
-                    async with sequence_lock:
-                        current_sequence = sequence_counter
-                        sequence_counter += 1
+                    # 搜索相关记忆（基于用户当前问题）
+                    if display_message:
+                        memories = await self.user_memory_service.search_memories(self.app_id, user_id, display_message, limit=5)
+                        logger.info(f"搜索记忆成功: {memories}")
+                    else:
+                        memories = await self.user_memory_service.get_user_memories(self.app_id, user_id, limit=5)
+                        logger.info(f"获取记忆成功: {memories}")
+                    
+                    # 格式化用户上下文
+                    user_context = self.user_memory_service.format_user_context(profile, memories)
+                    
+                    if user_context:
+                        logger.info(f"已加载用户 {user_id} 的记忆上下文，长度: {len(user_context)}")
+                    else:
+                        logger.info(f"用户 {user_id} 暂无记忆上下文")
                         
-                        # 更新卡片状态存储
-                        current_card_state["status"] = status_text
+                except Exception as e:
+                    logger.error(f"加载用户记忆失败: {e}")
+                    user_context = ""
+            else:
+                logger.info("用户记忆功能未启用")
+            
+            # 初始化当前卡片内容状态
+            current_card_state = {
+                "user_message": display_message,
+                "sender_name": user_info["name"],  # 使用用户真实姓名
+                "status": "🔄 **正在准备**...",
+                "think_title": "💭 **准备思考中...**",
+                "think_content": "",
+                "think_finished": False,
+                "answer_content": "",
+                "references_title": "📚 **知识库引用** (0)",
+                "references_content": "",
+                "bot_summary": "AI正在思考中...",  # 机器人问答状态
+                "image_cache": {},  # 添加图片缓存：{原始URL: 飞书img_key}
+                "processing_images": set()  # 添加正在处理的图片URL集合
+            }
+            
+            # 1. 创建流式卡片（不包含停止按钮）
+            card_content = self._build_card_content(current_card_state)
+            card_result = await self._create_card_entity(card_content)
+            
+            if card_result.get("code") != 0:
+                logger.error(f"创建流式卡片失败: {card_result}")
+                return
+            
+            card_id = card_result.get("data", {}).get("card_id")
+            if not card_id:
+                logger.error("创建流式卡片成功但未获取到card_id")
+                return
+            
+            # 将card_id添加到状态中，用于生成停止按钮
+            current_card_state["card_id"] = card_id
+            
+            # 初始化停止标志
+            self._class_stop_flags[card_id] = False
+            
+            # 2. 立即更新卡片内容，添加包含真实card_id的停止按钮
+            updated_card_content = self._build_card_content(current_card_state)
+            await self._update_card_settings(
+                card_id, updated_card_content, 1,
+                current_card_state["image_cache"], current_card_state["processing_images"]
+            )
+            
+            # 3. 发送卡片消息（现在包含真实的card_id）
+            send_result = await self._send_card_message_by_id(receive_id, card_id, receive_id_type)
+            if send_result.get("code") != 0:
+                logger.error(f"发送流式卡片消息失败: {send_result}")
+                return
+            
+            logger.info(f"流式卡片已发送: card_id={card_id}")
+            
+            # 4. 流式更新卡片内容
+            sequence_counter = 2  # 从2开始，因为1已经用于更新按钮
+            sequence_lock = asyncio.Lock()  # 序列号锁，确保并发安全
+            think_title_updated = False  # 思考标题更新标志
+            answer_title_updated = False  # 答案标题更新标志
+            
+            async def on_status_callback(status_text: str):
+                nonlocal sequence_counter, current_card_state
+                
+                # 检查停止标志
+                if self._class_stop_flags.get(card_id, False):
+                    logger.info(f"检测到停止标志，跳过状态更新: {status_text}")
+                    return
+                
+                # 在锁内部分配序列号并更新时间
+                async with sequence_lock:
+                    current_sequence = sequence_counter
+                    sequence_counter += 1
                     
-                        # 直接在锁内执行更新，避免异步任务的序列号冲突
-                        update_result = await self._update_card_element_content(
-                            card_id, "status", status_text, current_sequence
+                    # 更新卡片状态存储
+                    current_card_state["status"] = status_text
+                
+                    # 直接在锁内执行更新，避免异步任务的序列号冲突
+                    update_result = await self._update_card_element_content(
+                        card_id, "status", status_text, current_sequence
+                    )
+                    
+                    if update_result.get("code") == 0:
+                        # logger.debug(f"更新状态成功: {status_text}")
+                        pass
+                    else:
+                        logger.error(f"更新状态失败: {update_result}")
+            
+            async def on_think_callback(think_text: str):
+                nonlocal sequence_counter, think_title_updated, current_card_state
+
+                # 检查停止标志
+                if self._class_stop_flags.get(card_id, False):
+                    logger.info(f"检测到停止标志，跳过思考更新: 长度={len(think_text)}")
+                    return
+
+                # 处理文本中的图片链接（使用缓存避免重复处理）
+                try:
+                    processed_think_text = await self._process_images_in_text_with_cache(
+                        think_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                    )
+                    
+                    # 使用处理后的文本
+                    think_text = processed_think_text
+                    
+                except Exception as e:
+                    logger.error(f"处理思考文本中的图片失败: {str(e)}")
+                    # 图片处理失败时继续使用原文本
+
+                async with sequence_lock:
+                    # 首次有思考内容时，设置思考标题和思考内容
+                    if not think_title_updated and think_text:
+                        think_sequence = sequence_counter
+                        sequence_counter += 1
+                        think_title_updated = True  # 立即设置标志位
+                        
+                        think_title = "💭 **思考过程**"
+                        current_card_state["think_title"] = think_title
+                        current_card_state["think_content"] = " "
+
+                        # 构建完整的卡片内容
+                        complete_card_content = self._build_card_content(current_card_state)
+                        
+                        # 使用新的API进行全量更新
+                        logger.info(f"准备进行引用内容全量更新: 思考部分")
+                        update_result = await self._update_card_settings(
+                            card_id, complete_card_content, think_sequence,
+                            current_card_state["image_cache"], current_card_state["processing_images"]
                         )
                         
                         if update_result.get("code") == 0:
-                            # logger.debug(f"更新状态成功: {status_text}")
+                            logger.info(f"全量更新思考面板标题成功: {think_title}")
+                        else:
+                            logger.error(f"全量更新思考面板标题失败: {update_result}")
+                            think_title_updated = False  # 失败时重置标志位
+                    else:
+                        think_sequence = sequence_counter
+                        sequence_counter += 1
+                        current_card_state["think_content"] = think_text
+                        # 更新思考内容
+                        update_result = await self._update_card_element_content(
+                            card_id, "think_content", think_text, think_sequence
+                        )
+                        
+                        if update_result.get("code") == 0:
+                            # logger.debug(f"更新思考过程成功: 长度={len(think_text)}")
                             pass
                         else:
-                            logger.error(f"更新状态失败: {update_result}")
+                            logger.error(f"更新思考过程失败: {update_result}")
+            
+            async def on_answer_callback(answer_text: str):
+                nonlocal sequence_counter, answer_title_updated, current_card_state
                 
-                async def on_think_callback(think_text: str):
-                    nonlocal sequence_counter, think_title_updated, current_card_state
-
-                    # 处理文本中的图片链接（使用缓存避免重复处理）
-                    try:
-                        processed_think_text = await self._process_images_in_text_with_cache(
-                            think_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                # 检查停止标志
+                if self._class_stop_flags.get(card_id, False):
+                    logger.info(f"检测到停止标志，跳过答案更新: 长度={len(answer_text)}")
+                    return
+                
+                # 处理文本中的图片链接（使用缓存避免重复处理）
+                try:
+                    processed_answer_text = await self._process_images_in_text_with_cache(
+                        answer_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                    )
+                    
+                    # 使用处理后的文本
+                    answer_text = processed_answer_text
+                    
+                except Exception as e:
+                    logger.error(f"处理答案文本中的图片失败: {str(e)}")
+                    # 图片处理失败时继续使用原文本
+                
+                # 构建答案内容
+                answer_content = f"💡**回答**\n\n{answer_text}"
+                think_title = "💭 **已完成思考**"
+                current_card_state["answer_content"] = answer_content
+                current_card_state["think_title"] = think_title
+                current_card_state["think_finished"] = True
+                
+                async with sequence_lock:
+                    # 首次更新答案时，更新思考面板标题和答案内容
+                    if not answer_title_updated and answer_text:
+                        answer_sequence = sequence_counter
+                        sequence_counter += 1
+                        answer_title_updated = True  # 立即设置标志位
+                        
+                        # 构建完整的卡片内容
+                        complete_card_content = self._build_card_content(current_card_state)
+                        
+                        # 使用新的API进行全量更新
+                        logger.info(f"准备进行引用内容全量更新: 答案部分")
+                        update_result = await self._update_card_settings(
+                            card_id, complete_card_content, answer_sequence,
+                            current_card_state["image_cache"], current_card_state["processing_images"]
                         )
                         
-                        # 使用处理后的文本
-                        think_text = processed_think_text
+                        if update_result.get("code") == 0:
+                            logger.info(f"全量更新答案面板标题成功: {think_title}")
+                        else:
+                            logger.error(f"全量更新答案面板标题失败: {update_result}")
+                            answer_title_updated = False  # 失败时重置标志位
+                    else:
+                        answer_sequence = sequence_counter
+                        sequence_counter += 1
+                        # 更新答案部分
+                        update_result = await self._update_card_element_content(
+                            card_id, "answer", answer_content, answer_sequence
+                        )
                         
-                    except Exception as e:
-                        logger.error(f"处理思考文本中的图片失败: {str(e)}")
-                        # 图片处理失败时继续使用原文本
-
-                    async with sequence_lock:
-                        # 首次有思考内容时，设置思考标题和思考内容
-                        if not think_title_updated and think_text:
-                            think_sequence = sequence_counter
-                            sequence_counter += 1
-                            think_title_updated = True  # 立即设置标志位
-                            
-                            think_title = "💭 **思考过程**"
-                            current_card_state["think_title"] = think_title
-                            current_card_state["think_content"] = " "
-
-                            # 构建完整的卡片内容
+                        if update_result.get("code") == 0:
+                            # logger.debug(f"更新答案成功: 长度={len(answer_text)}")
+                            pass
+                        else:
+                            logger.error(f"更新答案失败: {update_result}")
+                            # 再次尝试构建完整的卡片内容
                             complete_card_content = self._build_card_content(current_card_state)
                             
                             # 使用新的API进行全量更新
-                            logger.info(f"准备进行引用内容全量更新: 思考部分")
-                            update_result = await self._update_card_settings(card_id, complete_card_content, think_sequence)
-                            
-                            if update_result.get("code") == 0:
-                                logger.info(f"全量更新思考面板标题成功: {think_title}")
-                            else:
-                                logger.error(f"全量更新思考面板标题失败: {update_result}")
-                                think_title_updated = False  # 失败时重置标志位
-                        else:
-                            think_sequence = sequence_counter
-                            sequence_counter += 1
-                            current_card_state["think_content"] = think_text
-                            # 更新思考内容
-                            update_result = await self._update_card_element_content(
-                                card_id, "think_content", think_text, think_sequence
+                            logger.info(f"再次尝试准备进行引用内容全量更新: 答案部分")
+                            update_result = await self._update_card_settings(
+                                card_id, complete_card_content, answer_sequence,
+                                current_card_state["image_cache"], current_card_state["processing_images"]
                             )
                             
                             if update_result.get("code") == 0:
-                                # logger.debug(f"更新思考过程成功: 长度={len(think_text)}")
-                                pass
+                                logger.info(f"再次尝试全量更新答案面板标题成功: {think_title}")
                             else:
-                                logger.error(f"更新思考过程失败: {update_result}")
+                                logger.error(f"再次尝试全量更新答案面板标题失败: {update_result}")
+            
+            async def on_references_callback(references_data: list):
+                """处理引用数据回调"""
+                nonlocal sequence_counter, current_card_state
                 
-                async def on_answer_callback(answer_text: str):
-                    nonlocal sequence_counter, answer_title_updated, current_card_state
-                    
-                    # 处理文本中的图片链接（使用缓存避免重复处理）
-                    try:
-                        processed_answer_text = await self._process_images_in_text_with_cache(
-                            answer_text, current_card_state["image_cache"], current_card_state["processing_images"]
-                        )
+                # 检查停止标志
+                if self._class_stop_flags.get(card_id, False):
+                    logger.info(f"检测到停止标志，跳过引用更新: {len(references_data) if references_data else 0} 条引用")
+                    return
+                
+                try:
+                    if references_data:
+                        logger.info(f"收到 {len(references_data)} 条引用数据")
                         
-                        # 使用处理后的文本
-                        answer_text = processed_answer_text
-                        
-                    except Exception as e:
-                        logger.error(f"处理答案文本中的图片失败: {str(e)}")
-                        # 图片处理失败时继续使用原文本
-                    
-                    # 构建答案内容
-                    answer_content = f"💡**回答**\n\n{answer_text}"
-                    current_card_state["answer_content"] = answer_content
-                    
-                    async with sequence_lock:
-                        # 首次更新答案时，更新思考面板标题和答案内容
-                        if not answer_title_updated and answer_text:
-                            answer_sequence = sequence_counter
-                            sequence_counter += 1
-                            answer_title_updated = True  # 立即设置标志位
-                            
-                            think_title = "💭 **已完成思考**"
-                            current_card_state["think_title"] = think_title
-                            current_card_state["answer_content"] = answer_content
-                            current_card_state["think_finished"] = True
-                            # 构建完整的卡片内容
-                            complete_card_content = self._build_card_content(current_card_state)
-                            
-                            # 使用新的API进行全量更新
-                            logger.info(f"准备进行引用内容全量更新: 答案部分")
-                            update_result = await self._update_card_settings(card_id, complete_card_content, answer_sequence)
-                            
-                            if update_result.get("code") == 0:
-                                logger.info(f"全量更新答案面板标题成功: {think_title}")
-                            else:
-                                logger.error(f"全量更新答案面板标题失败: {update_result}")
-                                answer_title_updated = False  # 失败时重置标志位
-                        else:
-                            answer_sequence = sequence_counter
-                            sequence_counter += 1
-                            # 更新答案部分
-                            update_result = await self._update_card_element_content(
-                                card_id, "answer", answer_content, answer_sequence
-                            )
-                            
-                            if update_result.get("code") == 0:
-                                # logger.debug(f"更新答案成功: 长度={len(answer_text)}")
-                                pass
-                            else:
-                                logger.error(f"更新答案失败: {update_result}")
-                
-                async def on_references_callback(references_data: list):
-                    """处理引用数据回调"""
-                    nonlocal sequence_counter, current_card_state
-                    
-                    try:
-                        if references_data:
-                            logger.info(f"收到 {len(references_data)} 条引用数据")
-                            
-                            # 更新卡片状态中的引用信息
-                            current_card_state["references_title"] = f"📚 **知识库引用** ({len(references_data)})"
-                            current_card_state["references_content"] = await self._get_references_content(references_data)
-                        else:
-                            logger.debug("引用数据为空，跳过更新")
-                    except Exception as e:
-                        logger.error(f"处理引用数据异常: {str(e)}")
-                
-                # 调用AI Chat详细流式接口（使用新的回调结构）
-                ai_answer = await self.aichat_service.chat_completion_streaming_enhanced(
-                    chat_id=f"feishu_{app_name}_user_{user_id}",
-                    message=user_message,
-                    variables={
-                        "feishu_user_id": user_info["user_id"],
-                        "feishu_mobile": user_info["mobile"],
-                        "feishu_name": user_info["name"]
-                    },
-                    on_status_callback=on_status_callback,
-                    on_think_callback=on_think_callback,
-                    on_answer_callback=on_answer_callback,
-                    on_references_callback=on_references_callback
+                        # 更新卡片状态中的引用信息
+                        current_card_state["references_title"] = f"📚 **知识库引用** ({len(references_data)})"
+                        current_card_state["references_content"] = await self._get_references_content(references_data)
+                    else:
+                        logger.debug("引用数据为空，跳过更新")
+                except Exception as e:
+                    logger.error(f"处理引用数据异常: {str(e)}")
+            
+            # 获取用户当前的聊天会话ID
+            try:
+                from app.services.user_chat_session_service import UserChatSessionService
+                session_service = UserChatSessionService()
+                current_chat_id = session_service.get_current_chat_id(
+                    app_id=self.app_id,
+                    user_id=user_id,
+                    app_name=app_name
                 )
-                
-                if ai_answer:
+                logger.info(f"使用聊天会话ID: {current_chat_id}")
+            except Exception as e:
+                # 如果获取失败，使用传统的拼接方式作为fallback
+                logger.warning(f"获取聊天会话ID失败，使用fallback: {str(e)}")
+                current_chat_id = f"feishu_{app_name}_user_{user_id}"
+            
+            # 获取用户的搜索偏好
+            dataset_search = True  # 默认值
+            web_search = False     # 默认值
+            try:
+                from app.services.user_search_preference_service import UserSearchPreferenceService
+                preference_service = UserSearchPreferenceService()
+                dataset_search, web_search = preference_service.get_search_preference(
+                    app_id=self.app_id,
+                    user_id=user_id
+                )
+                logger.info(f"用户搜索偏好: dataset={dataset_search}, web={web_search}")
+            except Exception as e:
+                logger.warning(f"获取搜索偏好失败，使用默认值: {str(e)}")
+            
+            # 创建停止检查函数
+            def should_stop():
+                return self._class_stop_flags.get(card_id, False)
+            
+            # 构建AI服务的variables，包含用户记忆上下文
+            variables = {
+                "feishu_user_id": user_info["user_id"],
+                "feishu_mobile": user_info["mobile"],
+                "feishu_name": user_info["name"],
+                "dataset": dataset_search,
+                "web": web_search,
+                "user_memory_context": ""
+            }
+            
+            # 如果有用户记忆上下文，添加到variables中
+            if user_context and user_context.strip() != "":
+                variables["user_memory_context"] = "当前用户画像和重要记忆如下：\n```" + user_context + "```"
+                logger.info("已将用户记忆上下文添加到AI请求中")
+            
+            # 调用AI Chat详细流式接口（使用新的回调结构）
+            ai_answer = await self.aichat_service.chat_completion_streaming(
+                chat_id=current_chat_id,
+                message=user_message,
+                variables=variables,
+                on_status_callback=on_status_callback,
+                on_think_callback=on_think_callback,
+                on_answer_callback=on_answer_callback,
+                on_references_callback=on_references_callback,
+                should_stop_callback=should_stop
+            )
+            
+            # 检查是否被用户停止
+            was_stopped = self._class_stop_flags.get(card_id, False)
+            
+            if ai_answer:
+                if was_stopped:
+                    logger.info(f"AI流式回复被用户停止，部分答案长度: {len(ai_answer)}")
+                    current_card_state["status"] = "❌ 答案已停止生成"
+                    current_card_state["bot_summary"] = "❌回答已停止"
+                else:
                     logger.info(f"AI流式回复成功，答案长度: {len(ai_answer)}")
-                    current_card_state["answer_content"] = "💡**回答**\n\n" + ai_answer
                     current_card_state["bot_summary"] = "💡回答：" + ai_answer
+                
+                # 如果已有答案内容，保持现有内容；否则设置最终答案
+                if not current_card_state.get("answer_content"):
+                    current_card_state["answer_content"] = "💡**回答**\n\n" + ai_answer
+            else:
+                if was_stopped:
+                    logger.info("AI流式回复被用户停止，无内容生成")
+                    current_card_state["status"] = "❌ 答案已停止生成"
+                    current_card_state["bot_summary"] = "❌回答已停止"
+                    if not current_card_state.get("answer_content"):
+                        current_card_state["answer_content"] = "❌ **回答已停止**\n\n用户已取消本次回答。"
                 else:
                     logger.warning("AI流式回复为空")
                     current_card_state["answer_content"] = "抱歉，我暂时无法理解您的问题，请换个方式提问。"
                     current_card_state["bot_summary"] = "回答失败"
 
-                # 最终更新卡片内容
-                complete_card_content = self._build_card_content(current_card_state)
-                await self._update_card_settings(card_id, complete_card_content, sequence_counter)
-                
-                return ai_answer
+            # 最终更新卡片内容（完成状态，移除停止按钮）
+            complete_card_content = self._build_card_content(current_card_state, finished=True)
+            await self._update_card_settings(
+                card_id, complete_card_content, sequence_counter,
+                current_card_state["image_cache"], current_card_state["processing_images"]
+            )
             
-            # 如果AI服务不可用，使用默认回复
-            return self._get_default_reply(user_message)
+            # 清理停止标志
+            if card_id in self._class_stop_flags:
+                del self._class_stop_flags[card_id]
+            
+            return ai_answer
             
         except Exception as e:
             logger.error(f"生成流式回复异常: {str(e)}")
             import traceback
             logger.error(f"错误详情: {traceback.format_exc()}")
+            
+            # 清理停止标志
+            if 'card_id' in locals() and card_id in self._class_stop_flags:
+                del self._class_stop_flags[card_id]
+            
             # 出现异常时返回默认回复
             return self._get_default_reply(user_message)
 
-    def _build_card_content(self, card_state: Dict[str, str] = None) -> Dict[str, Any]:
+    def stop_streaming_reply(self, card_id: str) -> bool:
+        """停止指定卡片的流式回复
+        
+        Args:
+            card_id: 卡片ID
+            
+        Returns:
+            bool: 是否成功设置停止标志
+        """
+        self._class_stop_flags[card_id] = True
+        logger.info(f"已设置停止标志: {card_id}")
+        return True
+
+    def _build_card_content(self, card_state: Dict[str, str] = None, finished: bool = False) -> Dict[str, Any]:
         """构建卡片内容（统一方法）
         
         Args:
@@ -534,7 +1377,7 @@ class FeishuBotService:
                 }
             },
             "config": {
-                "streaming_mode": True,
+                "streaming_mode": not finished,
                 "update_multi": True,
                 "summary": {
                     "content": card_state.get("bot_summary", "AI正在思考中...")
@@ -676,6 +1519,40 @@ class FeishuBotService:
                     }
                 ]
             })
+        
+        # 6. 停止回答按钮（只在流式回复过程中显示，且应用支持停止流式回答）
+        if not finished:
+            # 检查应用是否支持停止流式回答
+            support_stop_streaming = False
+            if self.app_config and hasattr(self.app_config, 'aichat_support_stop_streaming'):
+                support_stop_streaming = getattr(self.app_config, 'aichat_support_stop_streaming', False)
+            
+            if support_stop_streaming:
+                # 获取卡片ID用于生成唯一的action_id
+                card_id = card_state.get("card_id", "unknown")
+                
+                elements.append({"tag": "hr"})
+                elements.append({
+                    "tag": "button",
+                    "element_id": "stop_button",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": "❌ 停止回答"
+                    },
+                    "type": "danger",
+                    "size": "small", 
+                    "width": "default",
+                    "margin": "8px 0 0 0",  # 上边距
+                    "behaviors": [
+                        {
+                            "type": "callback",
+                            "value": {
+                                "action": "stop_streaming",
+                                "card_id": card_id
+                            }
+                        }
+                    ]
+                })
         
         return card
 
@@ -1021,19 +1898,198 @@ class FeishuBotService:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器出口"""
         await self.close()
+    
+    async def _process_audio_transcription(self, audio_file_path: str, sender_id: str, receive_id: str, receive_id_type: str):
+        """处理音频转录并回复用户
+        
+        Args:
+            audio_file_path: 音频文件路径
+            sender_id: 发送者ID
+            receive_id: 接收者ID
+            receive_id_type: 接收者类型
+        """
+        try:
+            logger.info(f"开始处理音频转录: {audio_file_path}")
+            
+            # 使用ASR服务进行转录
+            transcription_result = await self.asr_service.transcribe_audio_file(audio_file_path)
+            
+            if transcription_result["success"]:
+                transcribed_text = transcription_result["text"]
+                logger.info(f"语音转录成功: {transcribed_text}")
+                
+                # 如果有AI Chat服务，也可以进一步处理转录文本
+                if self.aichat_service:
+                    try:
+                        await self.generate_streaming_reply([{"type": "text", "text": transcribed_text}], sender_id, receive_id, receive_id_type)
+                        logger.info("基于转录文本的AI回复已发送")
+                    except Exception as e:
+                        logger.warning(f"AI处理转录文本失败: {str(e)}")
+                
+            else:
+                error_msg = transcription_result["error"]
+                logger.error(f"语音转录失败: {error_msg}")
+                
+                # 发送错误回复
+                reply_text = "❌ 抱歉，语音转录失败，可能是音频质量问题或网络错误。"
+                await self.send_text_message(receive_id, reply_text, receive_id_type)
+                
+        except Exception as e:
+            logger.error(f"处理音频转录异常: {str(e)}")
+            try:
+                # 发送异常回复
+                reply_text = "❌ 语音处理出现异常，请稍后重试。"
+                await self.send_text_message(receive_id, reply_text, receive_id_type)
+            except:
+                pass  # 避免回复失败导致的二次异常
 
-    async def _update_card_settings(self, card_id: str, card_content: Dict[str, Any], sequence: int = 1) -> dict:
+    async def _parse_post_content(self, post_content: Dict[str, Any], message_id: str) -> Dict[str, Any]:
+        """解析富文本消息内容，提取文字和图片
+        
+        Args:
+            post_content: 富文本消息内容
+            message_id: 消息ID，用于下载图片
+            
+        Returns:
+            Dict包含text_parts和image_parts
+        """
+        try:
+            text_parts = []
+            image_parts = []
+            
+            # 获取内容数组
+            content_array = post_content.get("content", [])
+            
+            for paragraph in content_array:
+                if isinstance(paragraph, list):
+                    for element in paragraph:
+                        if isinstance(element, dict):
+                            tag = element.get("tag", "")
+                            
+                            if tag == "text":
+                                # 提取文字内容
+                                text = element.get("text", "")
+                                if text.strip():
+                                    text_parts.append(text.strip())
+                                    
+                            elif tag == "img":
+                                # 提取图片信息
+                                image_key = element.get("image_key", "")
+                                width = element.get("width", 0)
+                                height = element.get("height", 0)
+                                
+                                if image_key:
+                                    logger.info(f"发现图片: image_key={image_key}, 尺寸={width}x{height}")
+                                    
+                                    # 下载图片并获取描述
+                                    image_info = await self._download_and_analyze_image(message_id, image_key)
+                                    image_info.update({
+                                        "image_key": image_key,
+                                        "width": width,
+                                        "height": height
+                                    })
+                                    image_parts.append(image_info)
+            
+            logger.info(f"解析富文本完成: 文字段落={len(text_parts)}, 图片={len(image_parts)}")
+            
+            return {
+                "text_parts": text_parts,
+                "image_parts": image_parts
+            }
+            
+        except Exception as e:
+            logger.error(f"解析富文本内容异常: {str(e)}")
+            return {
+                "text_parts": [],
+                "image_parts": []
+            }
+
+    async def _download_and_analyze_image(self, message_id: str, image_key: str) -> Dict[str, Any]:
+        """下载图片并转换为base64
+        
+        Args:
+            message_id: 消息ID
+            image_key: 图片key
+            
+        Returns:
+            Dict包含图片信息和base64数据
+        """
+        try:
+            # 获取tenant_access_token
+            token = await self.get_tenant_access_token()
+            
+            # 构建下载URL
+            url = f"{self.base_url}/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=file"
+            headers = {
+                "Authorization": f"Bearer {token}"
+            }
+            
+            logger.info(f"准备下载图片: {url}")
+            
+            # 下载图片
+            async with aiohttp.ClientSession() as client:
+                async with client.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        logger.info(f"下载图片成功，大小: {len(content)} bytes")
+                        
+                        # 检测图片格式
+                        if content.startswith(b'\xff\xd8\xff'):
+                            mime_type = 'image/jpeg'
+                        elif content.startswith(b'\x89PNG'):
+                            mime_type = 'image/png'
+                        elif content.startswith(b'GIF'):
+                            mime_type = 'image/gif'
+                        elif content.startswith(b'RIFF') and b'WEBP' in content[:12]:
+                            mime_type = 'image/webp'
+                        else:
+                            mime_type = 'image/jpeg'  # 默认格式
+                        
+                        # 转换为base64
+                        import base64
+                        base64_data = base64.b64encode(content).decode('utf-8')
+                        logger.info(f"图片转换为base64成功，格式: {mime_type}, 长度: {len(base64_data)}")
+                        
+                        return {
+                            "file_size": len(content),
+                            "base64_data": base64_data,
+                            "mime_type": mime_type,
+                            "success": True
+                        }
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"下载图片失败: {response.status}, 错误信息: {error_text}")
+                        return {
+                            "description": "图片下载失败",
+                            "success": False
+                        }
+                        
+        except Exception as e:
+            logger.error(f"下载和分析图片异常: {str(e)}")
+            return {
+                "description": "图片处理异常",
+                "success": False
+            }
+
+    async def _update_card_settings(self, card_id: str, card_content: Dict[str, Any], sequence: int = 1, 
+                                  image_cache: dict = None, processing_images: set = None) -> dict:
         """使用新的API全量更新卡片设置和内容
         
         Args:
             card_id: 卡片实体ID
             card_content: 完整的卡片内容
             sequence: 序列号，用于控制更新顺序
+            image_cache: 图片缓存字典
+            processing_images: 正在处理的图片URL集合
             
         Returns:
             dict: 更新结果
         """
         try:
+            # 如果提供了图片缓存，则处理卡片内容中的图片
+            if image_cache is not None and processing_images is not None:
+                card_content = await self._process_card_content_images(card_content, image_cache, processing_images)
+            
             token = await self.get_tenant_access_token()
             url = f"{self.base_url}/open-apis/cardkit/v1/cards/{card_id}"
             
@@ -1211,6 +2267,56 @@ class FeishuBotService:
             except Exception as e:
                 logger.warning(f"清理临时文件失败: {str(e)}")
 
+    async def _process_card_content_images(self, card_content: Dict[str, Any], image_cache: dict, processing_images: set) -> Dict[str, Any]:
+        """处理卡片内容中的图片链接
+        
+        Args:
+            card_content: 卡片内容字典
+            image_cache: 图片缓存字典
+            processing_images: 正在处理的图片URL集合
+            
+        Returns:
+            Dict[str, Any]: 处理后的卡片内容
+        """
+        try:
+            # 深拷贝卡片内容，避免修改原始数据
+            import copy
+            processed_content = copy.deepcopy(card_content)
+            
+            # 递归处理卡片内容中的所有文本字段
+            await self._process_card_element_images(processed_content, image_cache, processing_images)
+            
+            return processed_content
+            
+        except Exception as e:
+            logger.error(f"处理卡片内容图片异常: {str(e)}")
+            return card_content  # 出错时返回原内容
+
+    async def _process_card_element_images(self, element: Any, image_cache: dict, processing_images: set):
+        """递归处理卡片元素中的图片链接
+        
+        Args:
+            element: 卡片元素（可能是字典、列表或字符串）
+            image_cache: 图片缓存字典
+            processing_images: 正在处理的图片URL集合
+        """
+        try:
+            if isinstance(element, dict):
+                for key, value in element.items():
+                    if key == "content" and isinstance(value, str):
+                        # 处理content字段中的图片
+                        element[key] = await self._process_images_in_text_with_cache(value, image_cache, processing_images)
+                    else:
+                        # 递归处理其他字段
+                        await self._process_card_element_images(value, image_cache, processing_images)
+            elif isinstance(element, list):
+                for item in element:
+                    await self._process_card_element_images(item, image_cache, processing_images)
+            # 字符串和其他类型不需要处理
+            
+        except Exception as e:
+            logger.error(f"处理卡片元素图片异常: {str(e)}")
+
     async def _process_images_in_text_with_cache(self, text: str, image_cache: dict, processing_images: set) -> str:
         """处理文本中的图片链接，使用缓存避免重复处理
         
@@ -1264,7 +2370,10 @@ class FeishuBotService:
                 
                 # 检查是否正在处理中（使用原始URL作为键）
                 if cache_key in processing_images:
-                    logger.debug(f"图片正在处理中，跳过: {cache_key}")
+                    logger.debug(f"图片正在处理中，暂时显示为空: {cache_key}")
+                    # 如果图片正在处理中，暂时设置为空的markdown图片
+                    empty_link = f"![{alt_text}]()"
+                    replacements.append((full_match, empty_link))
                     continue
                 
                 # 新图片，需要下载和上传
@@ -1277,7 +2386,10 @@ class FeishuBotService:
                 try:
                     local_path = await self._download_image(image_url)
                     if not local_path:
-                        logger.warning(f"下载图片失败，保留原链接: {image_url}")
+                        logger.warning(f"下载图片失败，清空图片链接避免飞书安全错误: {image_url}")
+                        # 下载失败时清空图片URL，避免飞书外链安全错误
+                        empty_link = f"![{alt_text}]()"
+                        replacements.append((full_match, empty_link))
                         continue
                     
                     # 上传到飞书图床
@@ -1291,7 +2403,10 @@ class FeishuBotService:
                         logger.info(f"新图片处理成功: {image_url} -> {image_key}")
                         logger.debug(f"已添加到缓存，当前缓存大小: {len(image_cache)}")
                     else:
-                        logger.warning(f"上传图片到飞书失败，保留原链接: {image_url}")
+                        logger.warning(f"上传图片到飞书失败，清空图片链接避免飞书安全错误: {image_url}")
+                        # 上传失败时也清空图片URL，避免飞书外链安全错误
+                        empty_link = f"![{alt_text}]()"
+                        replacements.append((full_match, empty_link))
                         
                 finally:
                     # 无论成功失败，都要从处理中集合移除（使用原始URL作为键）
@@ -1308,4 +2423,135 @@ class FeishuBotService:
         except Exception as e:
             logger.error(f"处理图片链接异常: {str(e)}")
             return text  # 出错时返回原文本
+
+    async def _download_and_process_file(self, message_id: str, file_key: str, file_name: str = "unknown") -> Dict[str, Any]:
+        """下载文件并保存到本地图床目录
+        
+        Args:
+            message_id: 消息ID
+            file_key: 文件key
+            file_name: 文件名
+            
+        Returns:
+            Dict包含文件信息和访问URL
+        """
+        try:
+            # 获取tenant_access_token
+            token = await self.get_tenant_access_token()
+            
+            # 构建下载URL
+            url = f"{self.base_url}/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+            headers = {
+                "Authorization": f"Bearer {token}"
+            }
+            
+            logger.info(f"准备下载文件: {url}")
+            
+            # 下载文件
+            async with aiohttp.ClientSession() as client:
+                async with client.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        logger.info(f"下载文件成功，大小: {len(content)} bytes")
+                        
+                        # 检测文件类型（基于文件扩展名）
+                        file_ext = os.path.splitext(file_name.lower())[-1] if file_name else ""
+                        
+                        # 设置MIME类型
+                        mime_type_map = {
+                            '.pdf': 'application/pdf',
+                            '.doc': 'application/msword',
+                            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                            '.xls': 'application/vnd.ms-excel',
+                            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                            '.ppt': 'application/vnd.ms-powerpoint',
+                            '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                            '.txt': 'text/plain',
+                            '.json': 'application/json',
+                            '.xml': 'application/xml',
+                            '.csv': 'text/csv',
+                            '.zip': 'application/zip',
+                            '.rar': 'application/x-rar-compressed',
+                            '.7z': 'application/x-7z-compressed'
+                        }
+                        
+                        mime_type = mime_type_map.get(file_ext, 'application/octet-stream')
+                        
+                        # 生成安全的文件名（防止路径遍历攻击）
+                        import uuid
+                        import hashlib
+                        import datetime
+                        
+                        # 使用时间戳和随机UUID生成唯一文件名，保持原扩展名
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        unique_id = str(uuid.uuid4())[:8]
+                        safe_file_name = f"{timestamp}_{unique_id}{file_ext}"
+                        
+                        # 确保文件保存目录存在
+                        files_dir = os.path.join(os.getcwd(), "static", "files")
+                        os.makedirs(files_dir, exist_ok=True)
+                        
+                        # 构建完整的文件路径
+                        file_path = os.path.join(files_dir, safe_file_name)
+                        
+                        # 保存文件到本地
+                        with open(file_path, 'wb') as f:
+                            f.write(content)
+                        
+                        # 保存原始文件名映射（用于下载时显示正确的文件名）
+                        mapping_file = os.path.join(files_dir, f"{safe_file_name}.meta")
+                        with open(mapping_file, 'w', encoding='utf-8') as f:
+                            json.dump({
+                                "original_name": file_name,
+                                "safe_name": safe_file_name,
+                                "upload_time": timestamp,
+                                "file_size": len(content),
+                                "mime_type": mime_type
+                            }, f, ensure_ascii=False, indent=2)
+                        
+                        # 构建文件访问URL（使用API端点支持下载模式）
+                        if self.app_config and hasattr(self.app_config, 'image_bed_base_url'):
+                            base_url = getattr(self.app_config, 'image_bed_base_url')
+                            file_url = f"{base_url.rstrip('/')}/api/v1/static/files/{safe_file_name}"
+                        else:
+                            # 如果没有配置base_url，使用相对路径
+                            file_url = f"/api/v1/static/files/{safe_file_name}"
+                        
+                        logger.info(f"文件保存成功: {file_path}")
+                        logger.info(f"文件访问URL: {file_url}")
+                        logger.info(f"文件名映射保存: {mapping_file}")
+                        
+                        return {
+                            "file_name": file_name,
+                            "safe_file_name": safe_file_name,
+                            "file_size": len(content),
+                            "file_url": file_url,
+                            "local_path": file_path,
+                            "mime_type": mime_type,
+                            "file_extension": file_ext,
+                            "success": True
+                        }
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"下载文件失败: {response.status}, 错误信息: {error_text}")
+                        return {
+                            "error": f"下载失败: HTTP {response.status}",
+                            "success": False
+                        }
+                        
+        except Exception as e:
+            logger.error(f"下载和处理文件异常: {str(e)}")
+            return {
+                "error": f"文件处理异常: {str(e)}",
+                "success": False
+            }
+    
+    async def get_group_chat_context(self, app_id: str, chat_id: str, context_limit: int = 5) -> str:
+        """获取群聊上下文"""
+        try:
+            context = await self.chat_message_service.get_context_for_reply(app_id, chat_id, context_limit)
+            return context
+        except Exception as e:
+            logger.error(f"获取群聊上下文失败: {str(e)}")
+            return ""
     
