@@ -31,6 +31,7 @@ class FeishuApp(BaseModel):
     aichat_enable: Optional[bool] = False  # 是否启用AI Chat功能
     aichat_url: Optional[str] = None  # AI Chat API地址
     aichat_key: Optional[str] = None  # AI Chat API密钥
+    aichat_app_id: Optional[str] = None  # AI Chat应用ID
     aichat_support_stop_streaming: Optional[bool] = False  # 是否支持停止流式回答
     aichat_client_download_host: Optional[str] = None  # AI Chat读取集合API地址
     aichat_read_collection_url: Optional[str] = None  # AI Chat读取集合API地址

@@ -223,10 +223,9 @@ class BlockToMarkdown:
                 image_url = local_url
                 logger.info(f"图片块使用本地URL: {image_token} -> {image_url}")
             else:
-                # 如果没有本地URL，使用静态文件访问格式
-                # 假设图片已经下载到static/images目录，使用token作为文件名
-                image_url = f"/static/images/{image_token}.png"
-                logger.info(f"图片块使用静态URL: {image_token} -> {image_url}")
+                # 不存在对应文件，这里应该已经出错了。尝试使用短路径格式（可能是新生成的文件名）
+                image_url = f"/img/{image_token}.png"
+                logger.error(f"未找到飞书下载图片，图片块使用短路径URL: {image_token} -> {image_url}")
             
             # 添加image_bed_base_url前缀
             if app_config and hasattr(app_config, 'image_bed_base_url') and app_config.image_bed_base_url:
@@ -238,28 +237,45 @@ class BlockToMarkdown:
             
             # 获取图片描述
             alt_text = ""
-            if vlm_service and vlm_service.is_enabled():
+            
+            # 优先使用飞书文档中的图片描述（caption.content）
+            caption_content = block.get("image", {}).get("caption", {}).get("content", "").strip()
+            if caption_content:
+                alt_text = caption_content
+                logger.info(f"使用飞书图片描述: {image_token} -> {alt_text}")
+            
+            # 如果没有描述且VLM服务可用，才调用VLM生成描述
+            elif vlm_service and vlm_service.is_enabled():
                 try:
-                    # 构建本地图片文件路径
+                    # 构建本地图片文件路径，支持多种路径格式
+                    image_file_path = None
+                    
                     if local_url:
-                        # 从local_url中提取文件名
-                        local_path = local_url.replace("/static/images/", "")
+                        # 从local_url中提取文件名，支持新旧路径格式
+                        if local_url.startswith("/img/"):
+                            local_path = local_url.replace("/img/", "")
+                        elif local_url.startswith("/static/images/"):
+                            local_path = local_url.replace("/static/images/", "")
+                        else:
+                            local_path = local_url.split("/")[-1]  # 提取文件名
                         image_file_path = Path("static/images") / local_path
                     else:
                         # 使用token构建路径
                         image_file_path = Path("static/images") / f"{image_token}.png"
                     
-                    if image_file_path.exists():
+                    if image_file_path and image_file_path.exists():
                         description = await vlm_service.get_image_description(str(image_file_path))
                         if description:
                             alt_text = description
-                            logger.info(f"获取到图片描述: {image_token} -> {alt_text}")
+                            logger.info(f"VLM生成图片描述: {image_token} -> {alt_text}")
                         else:
-                            logger.debug(f"未获取到图片描述: {image_token}")
+                            logger.debug(f"VLM未生成图片描述: {image_token}")
                     else:
-                        logger.warning(f"图片文件不存在，无法获取描述: {image_file_path}")
+                        logger.warning(f"图片文件不存在，无法获取VLM描述: {image_file_path}")
                 except Exception as e:
-                    logger.error(f"获取图片描述异常: {image_token}, 错误: {str(e)}")
+                    logger.error(f"获取VLM图片描述异常: {image_token}, 错误: {str(e)}")
+            else:
+                logger.debug(f"无图片描述且VLM服务不可用: {image_token}")
             
             return f"{indent}![{alt_text}]({full_image_url})", True
             
@@ -373,8 +389,30 @@ class BlockToMarkdown:
                         content = f"`{content}`"
                 
                 text += content
-            # 处理其他可能的元素类型，如链接等
-            # 省略其他可能的处理...
+            
+            # 处理文档链接（mention_doc）
+            elif "mention_doc" in element:
+                mention_doc = element["mention_doc"]
+                title = mention_doc.get("title", "")
+                url = mention_doc.get("url", "")
+                
+                # 构建Markdown链接格式
+                if title and url:
+                    content = f"[{title}]({url})"
+                    logger.debug(f"处理mention_doc链接: {title} -> {url}")
+                elif title:
+                    # 如果只有标题没有URL，直接显示标题
+                    content = title
+                    logger.warning(f"mention_doc缺少URL: {title}")
+                else:
+                    # 如果都没有，跳过
+                    content = ""
+                    logger.warning(f"mention_doc缺少title和URL")
+                
+                text += content
+            
+            # 处理其他可能的元素类型
+            # 未来可以在这里扩展更多元素类型的处理
         
         return text
     

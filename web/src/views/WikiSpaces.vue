@@ -131,7 +131,7 @@
                       <el-icon v-if="data.has_child"><FolderOpened /></el-icon>
                       <el-icon v-else><Document /></el-icon>
                     </span>
-                    <span class="node-title">{{ data.title }}</span>
+                    <span class="node-title">{{ data.title }}<span v-if="data.obj_token" class="token-suffix">({{ data.obj_token }})</span></span>
                     <div class="node-actions">
                       <span v-if="data.obj_type && isPreviewable(data.obj_type)" class="preview-btn" @click.stop="previewDoc(data)">
                         <el-icon><View /></el-icon>
@@ -846,6 +846,13 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.token-suffix {
+  color: #909399;
+  font-size: 12px;
+  margin-left: 8px;
+  font-weight: normal;
 }
 
 .node-actions {

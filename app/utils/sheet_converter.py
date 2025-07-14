@@ -83,6 +83,9 @@ class SheetConverter:
                 # 处理不同类型的单元格数据
                 if cell is None:
                     cleaned_cell = ""
+                elif isinstance(cell, list):
+                    # 处理列表类型的单元格数据（通常包含链接信息）
+                    cleaned_cell = self._extract_text_from_cell_list(cell)
                 elif isinstance(cell, dict):
                     # 如果是字典，尝试提取文本内容
                     cleaned_cell = self._extract_text_from_cell_dict(cell)
@@ -122,6 +125,73 @@ class SheetConverter:
         else:
             # 如果都没有，返回整个字典的字符串表示
             return str(cell_dict)
+    
+    def _extract_text_from_cell_list(self, cell_list: list) -> str:
+        """从单元格列表中提取文本内容（处理飞书电子表格中的链接格式）
+        
+        Args:
+            cell_list: 单元格列表数据，包含文本和链接信息
+            
+        Returns:
+            str: 转换后的Markdown格式文本
+        """
+        if not cell_list:
+            return ""
+        
+        result_parts = []
+        
+        for element in cell_list:
+            if isinstance(element, dict):
+                element_type = element.get("type", "")
+                
+                if element_type == "url":
+                    # 处理普通URL链接: {"type": "url", "text": "这是百度链接", "link": "http://www.baidu.com"}
+                    text = element.get("text", "")
+                    link = element.get("link", "")
+                    if text and link:
+                        # URL解码
+                        import urllib.parse
+                        try:
+                            decoded_link = urllib.parse.unquote(link)
+                        except:
+                            decoded_link = link
+                        result_parts.append(f"[{text}]({decoded_link})")
+                    elif text:
+                        result_parts.append(text)
+                    elif link:
+                        result_parts.append(link)
+                        
+                elif element_type == "mention":
+                    # 处理飞书文档提及链接: {"type": "mention", "text": "调研分析", "link": "https://..."}
+                    text = element.get("text", "")
+                    link = element.get("link", "")
+                    if text and link:
+                        result_parts.append(f"[{text}]({link})")
+                    elif text:
+                        result_parts.append(text)
+                    elif link:
+                        result_parts.append(link)
+                        
+                elif element_type == "text":
+                    # 处理纯文本: {"type": "text", "text": " "}
+                    text = element.get("text", "")
+                    if text:
+                        result_parts.append(text)
+                        
+                else:
+                    # 未知类型，尝试提取text字段
+                    text = element.get("text", "")
+                    if text:
+                        result_parts.append(text)
+                    else:
+                        # 如果没有text字段，返回字典的字符串表示
+                        result_parts.append(str(element))
+                        
+            else:
+                # 非字典类型，直接转换为字符串
+                result_parts.append(str(element))
+        
+        return "".join(result_parts)
     
     def _clean_text(self, text: str) -> str:
         """清理文本内容

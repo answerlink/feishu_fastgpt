@@ -5,7 +5,7 @@ from app.services.feishu_service import FeishuService
 from typing import Dict, List, Optional
 from pydantic import BaseModel
 from datetime import datetime
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete, and_, or_
 from sqlalchemy import func
 from app.models.doc_subscription import DocSubscription
 from app.core.config import settings
@@ -1055,7 +1055,62 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                         
                         # 如果成功获取或创建知识库ID，上传文档
                         if first_level_dataset_id and temp_file_path:
-                            # 在上传之前，先按文件名删除可能存在的重复文档
+                            # 步骤1：先根据hierarchy_path和obj_edit_time进行去重
+                            if hierarchy_path and doc.obj_edit_time:
+                                logger.info(f"[层级路径去重] 开始检查相同层级路径的旧版本文档: hierarchy_path={hierarchy_path}")
+                                
+                                try:
+                                    # 查询同一应用下，相同hierarchy_path但obj_edit_time更早的记录
+                                    old_docs_query = await feishu_service.db.execute(
+                                        select(DocSubscription).where(
+                                            DocSubscription.app_id == request.app_id,
+                                            DocSubscription.hierarchy_path == hierarchy_path,
+                                            DocSubscription.obj_edit_time < doc.obj_edit_time,
+                                            DocSubscription.file_token != request.file_token,  # 排除当前文档
+                                            DocSubscription.collection_id.isnot(None)  # 只处理有collection_id的记录
+                                        )
+                                    )
+                                    old_docs = old_docs_query.scalars().all()
+                                    
+                                    if old_docs:
+                                        logger.info(f"[层级路径去重] 发现 {len(old_docs)} 个需要删除的旧版本文档")
+                                        
+                                        deleted_collections = 0
+                                        deleted_records = 0
+                                        
+                                        for old_doc in old_docs:
+                                            try:
+                                                # 删除FastGPT中的collection
+                                                if old_doc.collection_id:
+                                                    delete_result = await fastgpt_service.delete_collection(old_doc.collection_id)
+                                                    if delete_result.get("code") == 200:
+                                                        deleted_collections += 1
+                                                        logger.info(f"[层级路径去重] 成功删除旧版本collection: file_token={old_doc.file_token}, collection_id={old_doc.collection_id}")
+                                                    else:
+                                                        logger.warning(f"[层级路径去重] 删除collection失败: {delete_result.get('msg')}")
+                                                
+                                                # 删除数据库记录
+                                                await feishu_service.db.execute(
+                                                    delete(DocSubscription).where(DocSubscription.id == old_doc.id)
+                                                )
+                                                deleted_records += 1
+                                                logger.info(f"[层级路径去重] 成功删除旧版本记录: file_token={old_doc.file_token}, title={old_doc.title}")
+                                                
+                                            except Exception as e:
+                                                logger.error(f"[层级路径去重] 删除旧版本文档异常: file_token={old_doc.file_token}, error={str(e)}")
+                                        
+                                        # 提交数据库更改
+                                        await feishu_service.db.commit()
+                                        
+                                        logger.info(f"[层级路径去重] 完成旧版本清理: 删除了 {deleted_collections} 个collection, {deleted_records} 条记录")
+                                    else:
+                                        logger.info(f"[层级路径去重] 未发现需要删除的旧版本文档")
+                                        
+                                except Exception as e:
+                                    logger.error(f"[层级路径去重] 执行层级路径去重时发生异常: {str(e)}")
+                                    # 去重失败不影响后续上传流程，继续执行
+                            
+                            # 步骤2：按文件名删除可能存在的重复文档
                             doc_title_for_dedup = doc.title or f"文档-{request.file_token}"
                             
                             logger.info(f"[文件去重] 开始检查重复文档: filename={doc_title_for_dedup}, dataset_id={first_level_dataset_id}")
@@ -1118,6 +1173,20 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                                     )
                                     await feishu_service.db.commit()
                                     logger.info(f"成功更新文档的FastGPT知识库ID: {collection_id}")
+                                    
+                                    # 添加到文件名目录索引
+                                    if hierarchy_path:
+                                        try:
+                                            index_result = await fastgpt_service.add_to_filename_directory_index(
+                                                hierarchy_path=hierarchy_path,
+                                                collection_id=collection_id
+                                            )
+                                            if index_result.get("code") == 200:
+                                                logger.info(f"成功添加文件名目录索引: hierarchy_path={hierarchy_path}, collection_id={collection_id}")
+                                            else:
+                                                logger.warning(f"添加文件名目录索引失败，但不影响主流程: {index_result.get('message')}")
+                                        except Exception as e:
+                                            logger.warning(f"添加文件名目录索引时发生异常，但不影响主流程: {str(e)}")
                                 
                                 # 生成并更新dataset描述
                                 try:
@@ -1357,7 +1426,7 @@ async def get_sheet_content(
     sheet_token: str,
     sheet_id: str,
     range_str: str = Query(None, description="读取范围，如A1:Z100，为空则读取整个工作表"),
-    value_render_option: str = Query("ToString", description="单元格数据格式：ToString、Formula、FormattedValue、UnformattedValue"),
+    value_render_option: str = Query("FormattedValue", description="单元格数据格式：ToString、Formula、FormattedValue、UnformattedValue"),
     date_time_render_option: str = Query("FormattedString", description="日期时间格式：FormattedString"),
     feishu_service: FeishuService = Depends(get_feishu_service)
 ):
@@ -1390,6 +1459,197 @@ async def get_sheet_content(
     }
 
 # 手动生成dataset描述
+class TestDirectoryIndexRequest(BaseModel):
+    app_id: str
+    file_token: str
+    file_type: str = "docx"  # 默认为docx，也可以是sheet、pdf等
+    force_subscribe: bool = False  # 是否强制订阅文档（如果未订阅的话）
+
+@router.post("/test-directory-index", response_model=SubscribeResponse)
+async def test_directory_index_sync(
+    request: TestDirectoryIndexRequest,
+    feishu_service: FeishuService = Depends(get_feishu_service)
+):
+    """测试文件名目录索引功能
+    
+    手动输入app_id和file_token，测试文档同步和目录索引创建功能
+    
+    Args:
+        request: 包含app_id、file_token、file_type等参数的请求体
+        
+    Returns:
+        SubscribeResponse: 测试结果
+    """
+    try:
+        logger.info(f"开始测试文件名目录索引功能: app_id={request.app_id}, file_token={request.file_token}, file_type={request.file_type}")
+        
+        # 查询文档信息
+        query = await feishu_service.db.execute(
+            select(DocSubscription).where(
+                DocSubscription.app_id == request.app_id,
+                DocSubscription.file_token == request.file_token
+            )
+        )
+        doc = query.scalar_one_or_none()
+        
+        # 如果文档不存在且设置了强制订阅，先尝试订阅
+        if not doc and request.force_subscribe:
+            logger.info(f"文档未订阅，尝试先订阅文档: {request.file_token}")
+            try:
+                # 获取文档信息
+                doc_info = await feishu_service.get_document_meta(request.app_id, request.file_token)
+                if doc_info.get("code") == 0:
+                    doc_data = doc_info.get("data", {})
+                    title = doc_data.get("title", f"测试文档-{request.file_token}")
+                    
+                    # 订阅文档
+                    subscribe_result = await feishu_service.subscribe_doc_events(
+                        app_id=request.app_id,
+                        file_token=request.file_token,
+                        file_type=request.file_type,
+                        title=title
+                    )
+                    
+                    if subscribe_result.get("code") == 0:
+                        logger.info(f"成功订阅文档: {title}")
+                        # 重新查询文档
+                        query = await feishu_service.db.execute(
+                            select(DocSubscription).where(
+                                DocSubscription.app_id == request.app_id,
+                                DocSubscription.file_token == request.file_token
+                            )
+                        )
+                        doc = query.scalar_one_or_none()
+                    else:
+                        logger.error(f"订阅文档失败: {subscribe_result.get('msg')}")
+            except Exception as e:
+                logger.error(f"尝试订阅文档时发生错误: {str(e)}")
+        
+        if not doc:
+            return {
+                "code": -1,
+                "msg": f"找不到文档记录，请确保文档已订阅，或设置force_subscribe=true: app_id={request.app_id}, file_token={request.file_token}",
+                "data": {
+                    "suggestion": "你可以先调用订阅接口订阅文档，或者在请求中设置force_subscribe=true"
+                }
+            }
+        
+        logger.info(f"找到文档记录: title={doc.title}, file_type={doc.file_type}, hierarchy_path={doc.hierarchy_path}")
+        
+        # 创建同步请求
+        sync_request = SyncDocToAIChatRequest(
+            app_id=request.app_id,
+            file_token=request.file_token,
+            file_type=doc.file_type
+        )
+        
+        # 调用同步函数
+        result = await sync_document_to_aichat(sync_request, feishu_service)
+        
+        if result.get("code") == 0:
+            return {
+                "code": 0,
+                "msg": "测试成功！文档已同步到FastGPT并创建了文件名目录索引",
+                "data": {
+                    "app_id": request.app_id,
+                    "file_token": request.file_token,
+                    "document_title": doc.title,
+                    "hierarchy_path": doc.hierarchy_path,
+                    "file_type": doc.file_type,
+                    "collection_id": doc.collection_id,
+                    "sync_result": result
+                }
+            }
+        else:
+            return {
+                "code": result.get("code", -1),
+                "msg": f"测试失败: {result.get('msg', '未知错误')}",
+                "data": {
+                    "app_id": request.app_id,
+                    "file_token": request.file_token,
+                    "error_details": result
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"测试文件名目录索引功能时发生错误: {str(e)}")
+        return {
+            "code": -1,
+            "msg": f"测试过程中发生错误: {str(e)}",
+            "data": {
+                "app_id": request.app_id,
+                "file_token": request.file_token
+            }
+        }
+
+@router.post("/test-index-only", response_model=SubscribeResponse)
+async def test_index_only(
+    hierarchy_path: str,
+    collection_id: str,
+    app_id: str
+):
+    """仅测试文件名目录索引功能（不进行文档同步）
+    
+    直接测试添加文件名目录索引，不需要实际的文档同步过程
+    
+    Args:
+        hierarchy_path: 文档层级路径，如"AI产品资料###AI产品说明书###AI Product Description.docx"
+        collection_id: FastGPT中的collection ID
+        app_id: 应用ID
+        
+    Returns:
+        SubscribeResponse: 测试结果
+    """
+    try:
+        logger.info(f"开始测试文件名目录索引功能: hierarchy_path={hierarchy_path}, collection_id={collection_id}")
+        
+        # 初始化FastGPT服务
+        from app.services.fastgpt_service import FastGPTService
+        fastgpt_service = FastGPTService(app_id)
+        
+        try:
+            # 直接调用索引功能
+            result = await fastgpt_service.add_to_filename_directory_index(
+                hierarchy_path=hierarchy_path,
+                collection_id=collection_id
+            )
+            
+            if result.get("code") == 200:
+                return {
+                    "code": 0,
+                    "msg": "测试成功！文件名目录索引已创建",
+                    "data": {
+                        "hierarchy_path": hierarchy_path,
+                        "collection_id": collection_id,
+                        "index_result": result.get("data", {}),
+                        "index_dataset_id": result.get("data", {}).get("index_dataset_id"),
+                        "index_collection_id": result.get("data", {}).get("index_collection_id")
+                    }
+                }
+            else:
+                return {
+                    "code": -1,
+                    "msg": f"测试失败: {result.get('message', '未知错误')}",
+                    "data": {
+                        "hierarchy_path": hierarchy_path,
+                        "collection_id": collection_id,
+                        "error_details": result
+                    }
+                }
+        finally:
+            await fastgpt_service.close()
+            
+    except Exception as e:
+        logger.error(f"测试文件名目录索引功能时发生错误: {str(e)}")
+        return {
+            "code": -1,
+            "msg": f"测试过程中发生错误: {str(e)}",
+            "data": {
+                "hierarchy_path": hierarchy_path,
+                "collection_id": collection_id
+            }
+        }
+
 @router.post("/generate-dataset-description", response_model=SubscribeResponse)
 async def generate_dataset_description(
     app_id: str,
@@ -1449,4 +1709,230 @@ async def generate_dataset_description(
             "code": -1,
             "msg": f"生成dataset描述失败: {str(e)}",
             "data": None
-        } 
+        }
+
+
+class RebuildDirectoryIndexRequest(BaseModel):
+    app_id: str
+    space_id: Optional[str] = None  # 选填，如果提供则只处理该空间的文档
+    dry_run: Optional[bool] = False  # 是否仅预览，不实际创建
+
+
+@router.post("/rebuild-directory-index", response_model=SubscribeResponse)
+async def rebuild_directory_index(
+    request: RebuildDirectoryIndexRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """重建文件名目录索引
+    
+    扫描doc_subscription表中符合条件的文档记录，检查并创建缺失的文件名目录索引
+    
+    Args:
+        request: 重建请求，包含以下参数：
+                - app_id: 飞书应用ID（必填）
+                - space_id: 知识空间ID（选填），如果提供则只处理该空间的文档
+                - dry_run: 是否仅预览（默认False）
+                  * True: 只扫描和分析，不实际创建索引
+                  * False: 实际执行创建操作
+                  
+    Returns:
+        SubscribeResponse: 重建结果
+    """
+    try:
+        mode_text = "预览模式" if request.dry_run else "执行模式"
+        space_filter = f"空间ID: {request.space_id}" if request.space_id else "全部空间"
+        logger.info(f"🔧 收到文件名目录索引重建请求 - app_id: {request.app_id}, {space_filter}, {mode_text}")
+        
+        if request.dry_run:
+            logger.warning("🔍 DRY RUN 模式：将只扫描和分析，不会实际创建任何索引")
+        
+        # 构建查询条件
+        query_conditions = [
+            DocSubscription.app_id == request.app_id,
+            DocSubscription.status == 1,  # 必须是已订阅状态
+            DocSubscription.hierarchy_path.isnot(None),  # 必须有层级路径
+            DocSubscription.hierarchy_path != "",  # 层级路径不能为空
+            DocSubscription.collection_id.isnot(None),  # 必须有collection_id
+            DocSubscription.collection_id != ""  # collection_id不能为空
+        ]
+        
+        # 如果指定了空间ID，添加空间过滤条件
+        if request.space_id:
+            query_conditions.append(DocSubscription.space_id == request.space_id)
+        
+        # 查询符合条件的文档记录
+        logger.info(f"📊 开始扫描doc_subscription表...")
+        query = await db.execute(
+            select(DocSubscription).where(and_(*query_conditions))
+        )
+        documents = query.scalars().all()
+        
+        total_count = len(documents)
+        logger.info(f"📊 扫描完成，找到 {total_count} 条符合条件的文档记录")
+        
+        if total_count == 0:
+            return {
+                "code": 0,
+                "msg": "没有找到符合条件的文档记录",
+                "data": {
+                    "total_documents": 0,
+                    "processed": 0,
+                    "skipped": 0,
+                    "created": 0,
+                    "errors": 0
+                }
+            }
+        
+        # 创建FastGPT服务
+        from app.services.fastgpt_service import FastGPTService
+        fastgpt_service = FastGPTService(request.app_id)
+        
+        # 统计信息
+        stats = {
+            "total_documents": total_count,
+            "processed": 0,
+            "skipped": 0,
+            "created": 0,
+            "errors": 0,
+            "error_details": []
+        }
+        
+        try:
+            logger.info(f"🚀 开始处理文档索引...")
+            
+            for i, doc in enumerate(documents, 1):
+                try:
+                    logger.info(f"[{i}/{total_count}] 处理文档: {doc.title or '未命名'} (token: {doc.file_token})")
+                    stats["processed"] += 1
+                    
+                    # 检查索引是否已存在
+                    index_exists = await check_index_exists(fastgpt_service, doc.collection_id)
+                    
+                    if index_exists:
+                        logger.info(f"[{i}/{total_count}] ✓ 索引已存在，跳过: {doc.collection_id}.txt")
+                        stats["skipped"] += 1
+                        continue
+                    
+                    if request.dry_run:
+                        logger.info(f"[{i}/{total_count}] 🔍 [预览] 将创建索引: {doc.hierarchy_path} -> {doc.collection_id}.txt")
+                        stats["created"] += 1
+                    else:
+                        # 创建索引
+                        logger.info(f"[{i}/{total_count}] 📝 创建索引: {doc.hierarchy_path} -> {doc.collection_id}.txt")
+                        result = await fastgpt_service.add_to_filename_directory_index(
+                            doc.hierarchy_path, 
+                            doc.collection_id
+                        )
+                        
+                        if result.get("code") == 200:
+                            logger.info(f"[{i}/{total_count}] ✅ 成功创建索引: {doc.collection_id}.txt")
+                            stats["created"] += 1
+                        else:
+                            error_msg = f"创建索引失败: {result.get('message', '未知错误')}"
+                            logger.error(f"[{i}/{total_count}] ❌ {error_msg}")
+                            stats["errors"] += 1
+                            stats["error_details"].append({
+                                "file_token": doc.file_token,
+                                "title": doc.title,
+                                "collection_id": doc.collection_id,
+                                "error": error_msg
+                            })
+                
+                except Exception as e:
+                    error_msg = f"处理文档异常: {str(e)}"
+                    logger.error(f"[{i}/{total_count}] ❌ {error_msg}")
+                    stats["errors"] += 1
+                    stats["error_details"].append({
+                        "file_token": doc.file_token,
+                        "title": doc.title,
+                        "collection_id": doc.collection_id,
+                        "error": error_msg
+                    })
+            
+            # 输出最终统计
+            logger.info("=" * 60)
+            logger.info(f"📊 文件名目录索引重建完成统计")
+            logger.info("=" * 60)
+            logger.info(f"总文档数量: {stats['total_documents']}")
+            logger.info(f"已处理数量: {stats['processed']}")
+            logger.info(f"跳过数量（已存在）: {stats['skipped']}")
+            logger.info(f"{'预计创建' if request.dry_run else '成功创建'}数量: {stats['created']}")
+            logger.info(f"错误数量: {stats['errors']}")
+            
+            if stats['errors'] > 0:
+                logger.warning("❌ 错误详情:")
+                for i, error in enumerate(stats['error_details'], 1):
+                    logger.warning(f"  {i}. {error['title']} ({error['file_token']}): {error['error']}")
+            
+            logger.info("=" * 60)
+            
+            # 移除error_details中的详细信息，避免响应过大
+            response_data = stats.copy()
+            response_data["error_count"] = len(stats["error_details"])
+            if not request.dry_run:
+                del response_data["error_details"]  # 只在实际执行时移除详细错误信息
+            
+            success_rate = (stats['created'] + stats['skipped']) / stats['total_documents'] if stats['total_documents'] > 0 else 0
+            operation = "预览" if request.dry_run else "重建"
+            
+            return {
+                "code": 0,
+                "msg": f"文件名目录索引{operation}完成，成功率: {success_rate:.1%}",
+                "data": response_data
+            }
+            
+        finally:
+            await fastgpt_service.close()
+            
+    except Exception as e:
+        error_msg = f"文件名目录索引重建过程中发生异常: {str(e)}"
+        logger.error(error_msg)
+        
+        return {
+            "code": -1,
+            "msg": error_msg,
+            "data": None
+        }
+
+
+async def check_index_exists(fastgpt_service, collection_id: str) -> bool:
+    """检查指定collection_id的索引是否已存在
+    
+    Args:
+        fastgpt_service: FastGPT服务实例
+        collection_id: 要检查的collection ID
+        
+    Returns:
+        bool: 索引是否存在
+    """
+    try:
+        # 获取应用名称作为文件夹名
+        app_folder_name = getattr(fastgpt_service.app_config, 'app_name', None) or f"飞书应用-{fastgpt_service.app_id}"
+        
+        # 查找应用根文件夹
+        app_folder_id = await fastgpt_service.find_or_create_folder(app_folder_name)
+        if not app_folder_id:
+            return False
+        
+        # 查找"文件名目录索引"知识库
+        index_dataset_id = await fastgpt_service.find_or_create_dataset("文件名目录索引", parent_id=app_folder_id)
+        if not index_dataset_id:
+            return False
+        
+        # 搜索指定的索引文件
+        search_filename = f"{collection_id}.txt"
+        search_result = await fastgpt_service.get_collection_list(
+            dataset_id=index_dataset_id,
+            parent_id=None,
+            search_text=search_filename
+        )
+        
+        if search_result.get("code") != 200:
+            return False
+        
+        collections = search_result.get("data", {}).get("list", [])
+        return len(collections) > 0
+        
+    except Exception as e:
+        logger.warning(f"检查索引存在性异常: {str(e)}")
+        return False 

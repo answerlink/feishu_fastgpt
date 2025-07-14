@@ -98,7 +98,7 @@ async def get_image_info(filename: str):
             "size": stat.st_size,
             "created_time": stat.st_ctime,
             "modified_time": stat.st_mtime,
-            "url": f"/static/images/{filename}"
+            "url": f"/img/{filename}"
         }
         
     except HTTPException:

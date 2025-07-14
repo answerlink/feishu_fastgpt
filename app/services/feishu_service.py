@@ -1519,19 +1519,24 @@ class FeishuService:
                         )
                         
                         if image_info:
-                            # 创建新的图片块，使用本地URL
+                            # 创建新的图片块，使用本地URL但保留原始的其他字段
                             new_block = block.copy()
+                            original_image = block.get("image", {})
                             new_block["image"] = {
                                 "token": image_info["filename"],  # 使用新的UUID文件名
-                                "width": block.get("image", {}).get("width"),
-                                "height": block.get("image", {}).get("height"),
-                                "local_url": image_info["url"],  # 添加本地URL
+                                "width": original_image.get("width"),
+                                "height": original_image.get("height"),
+                                "local_url": image_info["short_url"],  # 添加本地URL
                                 "original_token": image_token,  # 保留原始token用于调试
-                                "file_size": image_info["size"]
+                                "file_size": image_info["size"],
+                                "align": original_image.get("align"),
+                                "caption": original_image.get("caption"),  # 重要：保留图片描述
                             }
+                            # 过滤掉None值，保持数据结构干净
+                            new_block["image"] = {k: v for k, v in new_block["image"].items() if v is not None}
                             processed_blocks.append(new_block)
                             processed_count += 1
-                            logger.debug(f"成功处理图片块: {image_token} -> {image_info['url']}")
+                            logger.debug(f"成功处理图片块: {image_token} -> {image_info['short_url']}, caption: {original_image.get('caption', {}).get('content', '无')}")
                         else:
                             # 如果下载失败，保留原始块但添加错误标记
                             error_block = block.copy()
@@ -1779,7 +1784,7 @@ class FeishuService:
             }
 
     async def get_sheet_content(self, app_id: str, spreadsheet_token: str, sheet_id: str, 
-                               range_str: str = None, value_render_option: str = "ToString",
+                               range_str: str = None, value_render_option: str = "FormattedValue",
                                date_time_render_option: str = "FormattedString") -> dict:
         """获取工作表内容（读取单元格数据）
         
@@ -1948,7 +1953,7 @@ class FeishuService:
                     spreadsheet_token, 
                     sheet_id, 
                     range_str,
-                    "ToString",  # 使用ToString格式，与成功的curl请求保持一致
+                    "FormattedValue",  # 不仅要获取值，还要获取格式
                     "FormattedString"  # 日期时间使用格式化字符串
                 )
                 

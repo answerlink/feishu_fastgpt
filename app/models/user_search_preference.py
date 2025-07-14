@@ -16,6 +16,7 @@ class UserSearchPreference(Base):
         dataset_search: 是否启用知识库搜索
         web_search: 是否启用联网搜索
         search_mode: 搜索模式描述（dataset/web/all）
+        model_id: 选择的模型ID
         created_at: 记录创建时间
         updated_at: 记录更新时间
     """
@@ -31,5 +32,6 @@ class UserSearchPreference(Base):
     dataset_search: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, comment="是否启用知识库搜索")
     web_search: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否启用联网搜索")
     search_mode: Mapped[str] = mapped_column(String(20), nullable=False, comment="搜索模式(dataset/web/all)")
+    model_id: Mapped[str] = mapped_column(String(100), nullable=True, comment="选择的模型ID")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, comment="记录创建时间")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, comment="记录更新时间") 

@@ -995,7 +995,9 @@ class FeishuBotService:
                 "references_content": "",
                 "bot_summary": "AI正在思考中...",  # 机器人问答状态
                 "image_cache": {},  # 添加图片缓存：{原始URL: 飞书img_key}
-                "processing_images": set()  # 添加正在处理的图片URL集合
+                "processing_images": set(),  # 添加正在处理的图片URL集合
+                "citation_cache": {},  # 添加引用缓存：{quote_id: 引用链接}
+                "processing_citations": set()  # 添加正在处理的引用ID集合
             }
             
             # 1. 创建流式卡片（不包含停止按钮）
@@ -1021,7 +1023,8 @@ class FeishuBotService:
             updated_card_content = self._build_card_content(current_card_state)
             await self._update_card_settings(
                 card_id, updated_card_content, 1,
-                current_card_state["image_cache"], current_card_state["processing_images"]
+                current_card_state["image_cache"], current_card_state["processing_images"],
+                current_card_state["citation_cache"], current_card_state["processing_citations"]
             )
             
             # 3. 发送卡片消息（现在包含真实的card_id）
@@ -1073,18 +1076,25 @@ class FeishuBotService:
                     logger.info(f"检测到停止标志，跳过思考更新: 长度={len(think_text)}")
                     return
 
-                # 处理文本中的图片链接（使用缓存避免重复处理）
+                # 处理文本中的图片链接和知识块引用（使用缓存避免重复处理）
                 try:
+                    # 先处理图片链接
                     processed_think_text = await self._process_images_in_text_with_cache(
                         think_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                    )
+                    
+                    # 再处理知识块引用
+                    processed_think_text = await self._process_citations_in_text_with_cache(
+                        processed_think_text, current_card_state["citation_cache"], current_card_state["processing_citations"],
+                        current_chat_id
                     )
                     
                     # 使用处理后的文本
                     think_text = processed_think_text
                     
                 except Exception as e:
-                    logger.error(f"处理思考文本中的图片失败: {str(e)}")
-                    # 图片处理失败时继续使用原文本
+                    logger.error(f"处理思考文本中的图片和引用失败: {str(e)}")
+                    # 处理失败时继续使用原文本
 
                 async with sequence_lock:
                     # 首次有思考内容时，设置思考标题和思考内容
@@ -1104,7 +1114,8 @@ class FeishuBotService:
                         logger.info(f"准备进行引用内容全量更新: 思考部分")
                         update_result = await self._update_card_settings(
                             card_id, complete_card_content, think_sequence,
-                            current_card_state["image_cache"], current_card_state["processing_images"]
+                            current_card_state["image_cache"], current_card_state["processing_images"],
+                            current_card_state["citation_cache"], current_card_state["processing_citations"]
                         )
                         
                         if update_result.get("code") == 0:
@@ -1135,18 +1146,28 @@ class FeishuBotService:
                     logger.info(f"检测到停止标志，跳过答案更新: 长度={len(answer_text)}")
                     return
                 
-                # 处理文本中的图片链接（使用缓存避免重复处理）
+                # 处理文本中的markdown表格分隔符、图片链接和知识块引用（使用缓存避免重复处理）
                 try:
+                    # 先处理markdown表格分隔符（飞书显示适配）
+                    processed_answer_text = self._process_markdown_table_separators(answer_text)
+                    
+                    # 再处理图片链接
                     processed_answer_text = await self._process_images_in_text_with_cache(
-                        answer_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                        processed_answer_text, current_card_state["image_cache"], current_card_state["processing_images"]
+                    )
+                    
+                    # 最后处理知识块引用
+                    processed_answer_text = await self._process_citations_in_text_with_cache(
+                        processed_answer_text, current_card_state["citation_cache"], current_card_state["processing_citations"],
+                        current_chat_id
                     )
                     
                     # 使用处理后的文本
                     answer_text = processed_answer_text
                     
                 except Exception as e:
-                    logger.error(f"处理答案文本中的图片失败: {str(e)}")
-                    # 图片处理失败时继续使用原文本
+                    logger.error(f"处理答案文本中的markdown、图片和引用失败: {str(e)}")
+                    # 处理失败时继续使用原文本
                 
                 # 构建答案内容
                 answer_content = f"💡**回答**\n\n{answer_text}"
@@ -1169,7 +1190,8 @@ class FeishuBotService:
                         logger.info(f"准备进行引用内容全量更新: 答案部分")
                         update_result = await self._update_card_settings(
                             card_id, complete_card_content, answer_sequence,
-                            current_card_state["image_cache"], current_card_state["processing_images"]
+                            current_card_state["image_cache"], current_card_state["processing_images"],
+                            current_card_state["citation_cache"], current_card_state["processing_citations"]
                         )
                         
                         if update_result.get("code") == 0:
@@ -1197,7 +1219,8 @@ class FeishuBotService:
                             logger.info(f"再次尝试准备进行引用内容全量更新: 答案部分")
                             update_result = await self._update_card_settings(
                                 card_id, complete_card_content, answer_sequence,
-                                current_card_state["image_cache"], current_card_state["processing_images"]
+                                current_card_state["image_cache"], current_card_state["processing_images"],
+                                current_card_state["citation_cache"], current_card_state["processing_citations"]
                             )
                             
                             if update_result.get("code") == 0:
@@ -1241,19 +1264,24 @@ class FeishuBotService:
                 logger.warning(f"获取聊天会话ID失败，使用fallback: {str(e)}")
                 current_chat_id = f"feishu_{app_name}_user_{user_id}"
             
-            # 获取用户的搜索偏好
+            # 获取用户的搜索偏好和模型偏好
             dataset_search = True  # 默认值
             web_search = False     # 默认值
+            model_id = None        # 默认值
             try:
                 from app.services.user_search_preference_service import UserSearchPreferenceService
                 preference_service = UserSearchPreferenceService()
-                dataset_search, web_search = preference_service.get_search_preference(
+                dataset_search, web_search, model_id = preference_service.get_search_preference(
                     app_id=self.app_id,
                     user_id=user_id
                 )
                 logger.info(f"用户搜索偏好: dataset={dataset_search}, web={web_search}")
+                if model_id:
+                    logger.info(f"用户模型偏好: model_id={model_id}")
+                else:
+                    logger.info(f"用户未设置模型偏好，使用默认模型")
             except Exception as e:
-                logger.warning(f"获取搜索偏好失败，使用默认值: {str(e)}")
+                logger.warning(f"获取用户偏好失败，使用默认值: {str(e)}")
             
             # 创建停止检查函数
             def should_stop():
@@ -1269,10 +1297,17 @@ class FeishuBotService:
                 "user_memory_context": ""
             }
             
+            # 如果用户设置了模型偏好，添加到variables中
+            if model_id:
+                variables["model_id"] = model_id
+            
             # 如果有用户记忆上下文，添加到variables中
             if user_context and user_context.strip() != "":
                 variables["user_memory_context"] = "当前用户画像和重要记忆如下：\n```" + user_context + "```"
                 logger.info("已将用户记忆上下文添加到AI请求中")
+            
+            # 检查是否配置了 aichat_app_id，决定是否保留数据集引用
+            has_aichat_app_id = bool(getattr(self.app_config, 'aichat_app_id', ''))
             
             # 调用AI Chat详细流式接口（使用新的回调结构）
             ai_answer = await self.aichat_service.chat_completion_streaming(
@@ -1283,7 +1318,8 @@ class FeishuBotService:
                 on_think_callback=on_think_callback,
                 on_answer_callback=on_answer_callback,
                 on_references_callback=on_references_callback,
-                should_stop_callback=should_stop
+                should_stop_callback=should_stop,
+                retain_dataset_cite=has_aichat_app_id
             )
             
             # 检查是否被用户停止
@@ -1317,7 +1353,8 @@ class FeishuBotService:
             complete_card_content = self._build_card_content(current_card_state, finished=True)
             await self._update_card_settings(
                 card_id, complete_card_content, sequence_counter,
-                current_card_state["image_cache"], current_card_state["processing_images"]
+                current_card_state["image_cache"], current_card_state["processing_images"],
+                current_card_state["citation_cache"], current_card_state["processing_citations"]
             )
             
             # 清理停止标志
@@ -2072,7 +2109,8 @@ class FeishuBotService:
             }
 
     async def _update_card_settings(self, card_id: str, card_content: Dict[str, Any], sequence: int = 1, 
-                                  image_cache: dict = None, processing_images: set = None) -> dict:
+                                  image_cache: dict = None, processing_images: set = None,
+                                  citation_cache: dict = None, processing_citations: set = None) -> dict:
         """使用新的API全量更新卡片设置和内容
         
         Args:
@@ -2081,6 +2119,8 @@ class FeishuBotService:
             sequence: 序列号，用于控制更新顺序
             image_cache: 图片缓存字典
             processing_images: 正在处理的图片URL集合
+            citation_cache: 引用缓存字典
+            processing_citations: 正在处理的引用ID集合
             
         Returns:
             dict: 更新结果
@@ -2089,6 +2129,10 @@ class FeishuBotService:
             # 如果提供了图片缓存，则处理卡片内容中的图片
             if image_cache is not None and processing_images is not None:
                 card_content = await self._process_card_content_images(card_content, image_cache, processing_images)
+            
+            # 如果提供了引用缓存，则处理卡片内容中的引用
+            if citation_cache is not None and processing_citations is not None:
+                card_content = await self._process_card_content_citations(card_content, citation_cache, processing_citations)
             
             token = await self.get_tenant_access_token()
             url = f"{self.base_url}/open-apis/cardkit/v1/cards/{card_id}"
@@ -2317,6 +2361,129 @@ class FeishuBotService:
         except Exception as e:
             logger.error(f"处理卡片元素图片异常: {str(e)}")
 
+    async def _process_card_content_citations(self, card_content: Dict[str, Any], citation_cache: dict, processing_citations: set) -> Dict[str, Any]:
+        """处理卡片内容中的知识块引用
+        
+        Args:
+            card_content: 卡片内容字典
+            citation_cache: 引用缓存字典
+            processing_citations: 正在处理的引用ID集合
+            
+        Returns:
+            Dict[str, Any]: 处理后的卡片内容
+        """
+        try:
+            # 深拷贝卡片内容，避免修改原始数据
+            import copy
+            processed_content = copy.deepcopy(card_content)
+            
+            # 递归处理卡片内容中的所有文本字段
+            await self._process_card_element_citations(processed_content, citation_cache, processing_citations)
+            
+            return processed_content
+            
+        except Exception as e:
+            logger.error(f"处理卡片内容引用异常: {str(e)}")
+            return card_content  # 出错时返回原内容
+
+    async def _process_card_element_citations(self, element: Any, citation_cache: dict, processing_citations: set):
+        """递归处理卡片元素中的知识块引用
+        
+        Args:
+            element: 卡片元素（可能是字典、列表或字符串）
+            citation_cache: 引用缓存字典
+            processing_citations: 正在处理的引用ID集合
+        """
+        try:
+            if isinstance(element, dict):
+                for key, value in element.items():
+                    if key == "content" and isinstance(value, str):
+                        # 处理content字段中的引用（但不需要chat_id，因为这是卡片更新，已经在流式过程中处理过了）
+                        element[key] = await self._process_citations_in_card_content(value, citation_cache)
+                    else:
+                        # 递归处理其他字段
+                        await self._process_card_element_citations(value, citation_cache, processing_citations)
+            elif isinstance(element, list):
+                for item in element:
+                    await self._process_card_element_citations(item, citation_cache, processing_citations)
+            # 字符串和其他类型不需要处理
+            
+        except Exception as e:
+            logger.error(f"处理卡片元素引用异常: {str(e)}")
+
+    async def _process_citations_in_card_content(self, text: str, citation_cache: dict) -> str:
+        """处理卡片内容中的知识块引用（简化版，只使用缓存）
+        
+        Args:
+            text: 包含知识块引用的文本
+            citation_cache: 引用缓存字典
+            
+        Returns:
+            str: 处理后的文本
+        """
+        try:
+            # 匹配知识块引用格式：[quote_id](CITE)
+            citation_pattern = r'\[([a-f0-9]{24})\]\(CITE\)'
+            
+            def replace_citation(match):
+                quote_id = match.group(1)
+                if quote_id in citation_cache:
+                    preview_url = citation_cache[quote_id]
+                    return f"[📌]({preview_url})"
+                else:
+                    # 如果缓存中没有，返回普通文本
+                    return "📌"
+            
+            processed_text = re.sub(citation_pattern, replace_citation, text)
+            return processed_text
+            
+        except Exception as e:
+            logger.error(f"处理卡片引用异常: {str(e)}")
+            return text
+
+    def _process_markdown_table_separators(self, content: str) -> str:
+        """处理并替换markdown表格分隔符
+        
+        1. 将空表格（只有标题行的表格）转换为引用格式
+        2. 将形如 "| :----: |\n\n---" 的模式替换为简单的 "---"
+        3. 处理单独的 "| :----: |" 模式
+        
+        这种处理专门针对飞书卡片显示，因为飞书不会展示 | :----: | 分隔符
+        
+        Args:
+            content: 需要处理的文本内容
+            
+        Returns:
+            str: 处理后的文本内容
+        """
+        # 优先处理空表格：| 标题内容 |\n| :----: |\n\n（可选地跟着---分隔线）
+        # 这种表格只有标题行，没有数据行，转换为引用格式
+        empty_table_pattern = r'\|\s*([^|]+?)\s*\|\n\|\s*:----:\s*\|\n\n(?:---\n\n|---\n|---$)?'
+        def replace_empty_table(match):
+            title_content = match.group(1).strip()
+            return f"⚠️ **注意**\n> {title_content}\n\n"
+        
+        processed_content = re.sub(empty_table_pattern, replace_empty_table, content)
+        
+        # 处理 | :----: | 后面跟着换行和分隔线的完整模式
+        # 需要区分两种情况：前面有换行的和前面没有换行的
+        pattern1 = r'\n\|\s*:----:\s*\|\n\n---'
+        processed_content = re.sub(pattern1, '\n---', processed_content)
+        
+        # 处理行首的 | :----: |\n\n--- 模式
+        pattern2 = r'^\|\s*:----:\s*\|\n\n---'
+        processed_content = re.sub(pattern2, '---', processed_content, flags=re.MULTILINE)
+        
+        # 处理剩余的单独 | :----: | 行
+        pattern3 = r'\|\s*:----:\s*\|\n'
+        processed_content = re.sub(pattern3, '\n', processed_content)
+        
+        # 最后处理任何剩余的 | :----: | 模式
+        pattern4 = r'\|\s*:----:\s*\|'
+        processed_content = re.sub(pattern4, '', processed_content)
+        
+        return processed_content
+
     async def _process_images_in_text_with_cache(self, text: str, image_cache: dict, processing_images: set) -> str:
         """处理文本中的图片链接，使用缓存避免重复处理
         
@@ -2423,6 +2590,117 @@ class FeishuBotService:
         except Exception as e:
             logger.error(f"处理图片链接异常: {str(e)}")
             return text  # 出错时返回原文本
+    
+    async def _process_citations_in_text_with_cache(self, text: str, citation_cache: dict, processing_citations: set, chat_id: str) -> str:
+        """处理文本中的知识块引用，使用缓存避免重复处理
+        
+        简化后的处理流程：
+        1. 识别 [quote_id](CITE) 格式的知识块引用
+        2. 直接构建预览URL，将参数（quote_id, app_id, chat_id）传递给前端页面
+        3. 将原引用替换为 [📌](预览链接)
+        4. 用户点击后，前端页面自己调用FastGPT API获取知识块数据并显示
+        
+        Args:
+            text: 包含知识块引用的文本
+            citation_cache: 引用缓存字典，键为quote_id，值为预览链接
+            processing_citations: 正在处理的引用ID集合
+            chat_id: 聊天ID
+            
+        Returns:
+            str: 处理后的文本，知识块引用已替换为预览链接
+        """
+        try:
+            # 匹配知识块引用格式：[quote_id](CITE)
+            citation_pattern = r'\[([a-f0-9]{24})\]\(CITE\)'
+            matches = re.finditer(citation_pattern, text)
+            
+            # 存储需要替换的内容
+            replacements = []
+            for match in matches:
+                quote_id = match.group(1)
+                full_match = match.group(0)
+                
+                # 检查缓存中是否已有处理结果
+                if quote_id in citation_cache:
+                    preview_url = citation_cache[quote_id]
+                    new_link = f"[📌]({preview_url})"
+                    replacements.append((full_match, new_link))
+                    logger.debug(f"使用缓存引用: {quote_id} -> {preview_url}")
+                    continue
+                
+                # 检查是否正在处理中
+                if quote_id in processing_citations:
+                    logger.debug(f"引用正在处理中，暂时显示为空: {quote_id}")
+                    # 如果引用正在处理中，暂时设置为普通文本
+                    temp_link = f"📌"
+                    replacements.append((full_match, temp_link))
+                    continue
+                
+                # 新引用，需要获取数据并创建预览
+                logger.info(f"发现新知识块引用，开始处理: {quote_id}")
+                
+                # 标记为处理中
+                processing_citations.add(quote_id)
+                
+                try:
+                    # 直接构建预览URL，包含必要的参数
+                    preview_url = await self._create_quote_preview_url(quote_id, chat_id)
+                    if preview_url:
+                        new_link = f"[📌]({preview_url})"
+                        replacements.append((full_match, new_link))
+                        # 缓存处理结果
+                        citation_cache[quote_id] = preview_url
+                        logger.info(f"新引用处理成功: {quote_id} -> {preview_url}")
+                    else:
+                        logger.warning(f"创建预览URL失败，使用普通文本: {quote_id}")
+                        temp_link = f"📌"
+                        replacements.append((full_match, temp_link))
+                        
+                finally:
+                    # 无论成功失败，都要从处理中集合移除
+                    processing_citations.discard(quote_id)
+            
+            # 执行替换
+            processed_text = text
+            for old_link, new_link in replacements:
+                processed_text = processed_text.replace(old_link, new_link)
+            
+            return processed_text
+            
+        except Exception as e:
+            logger.error(f"处理知识块引用异常: {str(e)}")
+            return text  # 出错时返回原文本
+    
+    async def _create_quote_preview_url(self, quote_id: str, chat_id: str) -> Optional[str]:
+        """创建知识块预览URL（简化版，直接传递参数）
+        
+        Args:
+            quote_id: 知识块ID
+            chat_id: 聊天ID
+            
+        Returns:
+            str: 预览链接，失败返回None
+        """
+        try:
+            # 检查是否有图床配置用于构建完整URL
+            if not self.app_config or not hasattr(self.app_config, 'image_bed_base_url'):
+                logger.warning("image_bed_base_url配置不完整，无法创建预览链接")
+                return None
+            
+            base_url = getattr(self.app_config, 'image_bed_base_url')
+            
+            # 使用aichat_app_id
+            app_id_for_preview = getattr(self.app_config, 'aichat_app_id', '')
+            
+            # 直接构建预览URL，将参数传递给前端页面
+            preview_url = f"{base_url.rstrip('/')}/api/v1/collection-viewer/view-quote/{quote_id}?app_id={app_id_for_preview}&chat_id={chat_id}"
+            
+            logger.info(f"创建知识块预览URL: {preview_url}")
+            return preview_url
+            
+        except Exception as e:
+            logger.error(f"创建预览URL异常: {str(e)}")
+            return None
 
     async def _download_and_process_file(self, message_id: str, file_key: str, file_name: str = "unknown") -> Dict[str, Any]:
         """下载文件并保存到本地图床目录

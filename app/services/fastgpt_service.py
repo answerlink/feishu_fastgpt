@@ -165,6 +165,39 @@ class FastGPTService:
             
         return result
     
+    async def find_or_create_folder(self, name: str, parent_id: str = None) -> Optional[str]:
+        """查找或创建文件夹
+        
+        先尝试在指定位置查找同名文件夹，如果不存在则创建新的文件夹
+        
+        Args:
+            name: 文件夹名称
+            parent_id: 父文件夹ID，可选
+            
+        Returns:
+            Optional[str]: 文件夹ID，如查找和创建都失败则返回None
+        """
+        # 获取当前目录列表
+        list_result = await self.get_dataset_list(parent_id)
+        
+        if list_result.get("code") != 200:
+            return None
+            
+        # 查找同名文件夹
+        items = list_result.get("data", [])
+        for item in items:
+            if item.get("name") == name and item.get("type") == "folder":
+                logger.info(f"找到已存在的文件夹: {name}, ID: {item.get('_id')}")
+                return item.get("_id")
+        
+        # 如果没找到，创建新文件夹
+        create_result = await self.create_folder(name, parent_id=parent_id)
+        
+        if create_result.get("code") == 200:
+            return create_result.get("data", {}).get("_id")
+            
+        return None
+
     async def find_or_create_dataset(self, name: str, parent_id: str = None) -> Optional[str]:
         """查找或创建知识库
         
@@ -324,16 +357,29 @@ class FastGPTService:
                 "msg": f"检查文档存在性异常: {str(e)}"
             }
     
-    async def delete_collection(self, collection_id: str) -> dict:
+    async def delete_collection(self, collection_id: str, delete_index: bool = True) -> dict:
         """删除知识库中的集合
         
         Args:
             collection_id: 集合ID
+            delete_index: 是否同时删除文件名目录索引，默认为True
             
         Returns:
             dict: 删除结果
         """
         try:
+            # 先删除文件名目录索引（如果启用）
+            if delete_index:
+                try:
+                    index_delete_result = await self.delete_from_filename_directory_index(collection_id)
+                    if index_delete_result.get("code") == 200:
+                        logger.info(f"成功从文件名目录索引删除: collection_id={collection_id}")
+                    else:
+                        logger.info(f"文件名目录索引删除结果: {index_delete_result.get('message')}")
+                except Exception as e:
+                    logger.warning(f"删除文件名目录索引异常: {str(e)}")
+            
+            # 删除FastGPT中的collection
             url = f"{self.base_url}/api/core/dataset/collection/delete"
             params = {
                 "id": collection_id
@@ -654,6 +700,216 @@ class FastGPTService:
             return {
                 "code": -1,
                 "message": f"生成并更新dataset描述异常: {str(e)}"
+            }
+    
+    async def add_to_filename_directory_index(self, hierarchy_path: str, collection_id: str) -> dict:
+        """添加文件路径和collection_id到文件名目录索引知识库
+        
+        Args:
+            hierarchy_path: 文档层级路径，如"AI产品资料###AI产品说明书###AI Product Description.docx"
+            collection_id: FastGPT中的collection ID
+            
+        Returns:
+            dict: 处理结果
+        """
+        try:
+            import os
+            from pathlib import Path
+            
+            logger.info(f"开始添加文件名目录索引: hierarchy_path={hierarchy_path}, collection_id={collection_id}")
+            
+            # 获取应用名称作为文件夹名，如果配置中没有app_name则使用app_id
+            app_folder_name = getattr(self.app_config, 'app_name', None) or f"飞书应用-{self.app_id}"
+            
+            # 1. 先创建或查找应用根文件夹
+            app_folder_id = await self.find_or_create_folder(app_folder_name)
+            if not app_folder_id:
+                logger.error(f"无法创建或获取应用文件夹: {app_folder_name}")
+                return {
+                    "code": -1,
+                    "message": f"无法创建或获取应用文件夹: {app_folder_name}"
+                }
+            
+            logger.info(f"成功获取或创建应用文件夹: {app_folder_name}, ID: {app_folder_id}")
+            
+            # 2. 在应用文件夹下创建或查找"文件名目录索引"知识库
+            index_dataset_name = "文件名目录索引"
+            index_dataset_id = await self.find_or_create_dataset(index_dataset_name, parent_id=app_folder_id)
+            
+            if not index_dataset_id:
+                logger.error(f"无法创建或获取文件名目录索引知识库")
+                return {
+                    "code": -1,
+                    "message": "无法创建或获取文件名目录索引知识库"
+                }
+            
+            logger.info(f"成功获取或创建文件名目录索引知识库: {index_dataset_name}, ID: {index_dataset_id}")
+            
+            # 准备要添加的内容
+            index_content = hierarchy_path
+            
+            # 创建临时文件
+            temp_dir = Path("temp")
+            temp_dir.mkdir(exist_ok=True)
+            
+            # 使用collection_id作为文件名
+            temp_file_path = temp_dir / f"{collection_id}.txt"
+            
+            try:
+                # 写入内容到临时文件
+                with open(temp_file_path, 'w', encoding='utf-8') as f:
+                    f.write(index_content)
+                
+                logger.info(f"临时索引文件创建成功: {temp_file_path}, 内容: {index_content}")
+                
+                # 在上传前先删除可能存在的同名文件
+                try:
+                    dedup_result = await self.delete_collections_by_name(
+                        dataset_id=index_dataset_id,
+                        filename=f"{collection_id}.txt",
+                        parent_id=None
+                    )
+                    if dedup_result.get("code") == 0 and dedup_result.get("deleted_count", 0) > 0:
+                        logger.info(f"删除了 {dedup_result.get('deleted_count')} 个重复的索引文件")
+                except Exception as e:
+                    logger.warning(f"删除重复索引文件时发生异常: {str(e)}")
+                
+                # 上传文件到知识库
+                upload_result = await self.upload_file_to_dataset(
+                    dataset_id=index_dataset_id,
+                    file_path=str(temp_file_path),
+                    chunk_size=512
+                )
+                
+                if upload_result.get("code") == 200:
+                    logger.info(f"成功添加文件名目录索引: hierarchy_path={hierarchy_path}, collection_id={collection_id}")
+                    return {
+                        "code": 200,
+                        "message": "成功添加文件名目录索引",
+                        "data": {
+                            "index_dataset_id": index_dataset_id,
+                            "index_collection_id": upload_result.get("data", {}).get("collectionId"),
+                            "hierarchy_path": hierarchy_path,
+                            "collection_id": collection_id
+                        }
+                    }
+                else:
+                    logger.error(f"上传文件名目录索引失败: {upload_result.get('message')}")
+                    return {
+                        "code": -1,
+                        "message": f"上传文件名目录索引失败: {upload_result.get('message')}"
+                    }
+                    
+            finally:
+                # 清理临时文件
+                try:
+                    if temp_file_path.exists():
+                        os.remove(temp_file_path)
+                        logger.info(f"已清理临时索引文件: {temp_file_path}")
+                except Exception as e:
+                    logger.warning(f"清理临时索引文件失败: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"添加文件名目录索引异常: hierarchy_path={hierarchy_path}, collection_id={collection_id}, error={str(e)}")
+            return {
+                "code": -1,
+                "message": f"添加文件名目录索引异常: {str(e)}"
+            }
+    
+    async def delete_from_filename_directory_index(self, collection_id: str) -> dict:
+        """从文件名目录索引中删除指定的collection索引
+        
+        Args:
+            collection_id: 要删除的collection ID
+            
+        Returns:
+            dict: 删除结果
+        """
+        try:
+            logger.info(f"开始从文件名目录索引删除: collection_id={collection_id}")
+            
+            # 获取应用名称作为文件夹名
+            app_folder_name = getattr(self.app_config, 'app_name', None) or f"飞书应用-{self.app_id}"
+            
+            # 1. 查找应用根文件夹
+            app_folder_id = await self.find_or_create_folder(app_folder_name)
+            if not app_folder_id:
+                logger.info(f"应用文件夹不存在，无需删除索引: {app_folder_name}")
+                return {
+                    "code": 0,
+                    "message": "应用文件夹不存在，无需删除索引"
+                }
+            
+            # 2. 查找"文件名目录索引"知识库
+            index_dataset_name = "文件名目录索引"
+            index_dataset_id = await self.find_or_create_dataset(index_dataset_name, parent_id=app_folder_id)
+            
+            if not index_dataset_id:
+                logger.info(f"文件名目录索引知识库不存在，无需删除索引")
+                return {
+                    "code": 0,
+                    "message": "文件名目录索引知识库不存在，无需删除索引"
+                }
+            
+            logger.info(f"找到文件名目录索引知识库: {index_dataset_name}, ID: {index_dataset_id}")
+            
+            # 3. 通过搜索查找对应的索引文件
+            search_filename = f"{collection_id}.txt"
+            search_result = await self.get_collection_list(
+                dataset_id=index_dataset_id,
+                parent_id=None,
+                search_text=search_filename
+            )
+            
+            if search_result.get("code") != 200:
+                logger.warning(f"搜索索引文件失败: {search_result.get('message')}")
+                return {
+                    "code": 0,
+                    "message": f"搜索索引文件失败: {search_result.get('message')}"
+                }
+            
+            collections = search_result.get("data", {}).get("list", [])
+            
+            if not collections:
+                logger.info(f"未找到对应的索引文件: {search_filename}")
+                return {
+                    "code": 0,
+                    "message": f"未找到对应的索引文件: {search_filename}"
+                }
+            
+            # 4. 删除找到的索引文件
+            deleted_count = 0
+            for collection in collections:
+                index_collection_id = collection.get("_id")
+                if index_collection_id:
+                    delete_result = await self.delete_collection(index_collection_id)
+                    if delete_result.get("code") == 200:
+                        deleted_count += 1
+                        logger.info(f"成功删除索引文件: collection_id={collection_id}, index_collection_id={index_collection_id}")
+                    else:
+                        logger.warning(f"删除索引文件失败: {delete_result.get('message')}")
+            
+            if deleted_count > 0:
+                logger.info(f"成功删除 {deleted_count} 个索引文件: collection_id={collection_id}")
+                return {
+                    "code": 200,
+                    "message": f"成功删除 {deleted_count} 个索引文件",
+                    "data": {
+                        "deleted_count": deleted_count,
+                        "collection_id": collection_id
+                    }
+                }
+            else:
+                return {
+                    "code": 0,
+                    "message": "没有索引文件被删除"
+                }
+                
+        except Exception as e:
+            logger.error(f"从文件名目录索引删除异常: collection_id={collection_id}, error={str(e)}")
+            return {
+                "code": -1,
+                "message": f"从文件名目录索引删除异常: {str(e)}"
             }
     
     async def __aenter__(self):

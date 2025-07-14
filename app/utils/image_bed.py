@@ -8,6 +8,7 @@
 import os
 import uuid
 import re
+import time
 from pathlib import Path
 from typing import Dict, Optional
 from app.core.logger import setup_logger
@@ -27,7 +28,7 @@ class ImageBed:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         
     def generate_image_filename(self, original_token: str = None) -> str:
-        """生成图片文件名（使用UUID）
+        """生成图片文件名（短UUID + 时间戳）
         
         Args:
             original_token: 原始图片token（可选，仅用于日志）
@@ -35,7 +36,11 @@ class ImageBed:
         Returns:
             str: 新的文件名（不含扩展名）
         """
-        new_filename = str(uuid.uuid4()).replace('-', '')
+        # 使用时间戳（秒级）+ 短UUID（8位）生成更短的文件名
+        timestamp = hex(int(time.time()))[2:]  # 去掉0x前缀
+        short_uuid = str(uuid.uuid4()).replace('-', '')[:8]
+        new_filename = f"{timestamp}{short_uuid}"
+        
         if original_token:
             logger.info(f"生成新图片文件名: {original_token} -> {new_filename}")
         return new_filename
@@ -52,17 +57,21 @@ class ImageBed:
         """
         return self.base_dir / f"{filename}.{extension}"
     
-    def get_image_url(self, filename: str, extension: str = "png") -> str:
+    def get_image_url(self, filename: str, extension: str = "png", use_short_path: bool = True) -> str:
         """获取图片访问URL
         
         Args:
             filename: 文件名（不含扩展名）
             extension: 文件扩展名，默认png
+            use_short_path: 是否使用短路径，True使用/img/，False使用/static/images/
             
         Returns:
             str: 图片访问URL
         """
-        return f"/static/images/{filename}.{extension}"
+        if use_short_path:
+            return f"/img/{filename}.{extension}"
+        else:
+            return f"/static/images/{filename}.{extension}"
     
     async def download_and_store_image(self, feishu_service, app_id: str, image_token: str) -> Optional[Dict[str, str]]:
         """下载并存储图片
@@ -100,7 +109,8 @@ class ImageBed:
                 return None
             
             file_size = image_path.stat().st_size
-            image_url = self.get_image_url(filename, extension)
+            short_url = self.get_image_url(filename, extension, use_short_path=True)
+            legacy_url = self.get_image_url(filename, extension, use_short_path=False)
             
             logger.info(f"成功下载并存储图片: {image_token} -> {filename}.{extension}, 大小: {file_size}字节")
             
@@ -109,7 +119,8 @@ class ImageBed:
                 "filename": filename,
                 "extension": extension,
                 "path": str(image_path),
-                "url": image_url,
+                "short_url": short_url,  # 短路径URL
+                "legacy_url": legacy_url,  # 兼容性长路径URL
                 "size": file_size
             }
             
@@ -182,7 +193,7 @@ class ImageBed:
             for image_token in image_tokens:
                 image_info = await self.download_and_store_image(feishu_service, app_id, image_token)
                 if image_info:
-                    image_mapping[image_token] = image_info["url"]
+                    image_mapping[image_token] = image_info["short_url"]
                 else:
                     logger.error(f"处理图片失败: {image_token}")
             

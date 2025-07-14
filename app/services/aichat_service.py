@@ -24,7 +24,7 @@ class AIChatService:
     
     async def chat_completion_streaming(self, message: List[Dict[str, Any]], variables: Dict[str, Any] = None, chat_id: str = None,
                                                on_status_callback=None, on_think_callback=None, on_answer_callback=None,
-                                               on_references_callback=None, should_stop_callback=None) -> str:
+                                               on_references_callback=None, should_stop_callback=None, retain_dataset_cite: bool = False) -> str:
         """调用AI Chat接口获取回复（支持状态、思考和答案的分离回调，支持多模态）
         
         Args:
@@ -35,6 +35,7 @@ class AIChatService:
             on_answer_callback: 答案回调函数，接收(answer_text)参数
             on_references_callback: 引用数据回调函数，接收(references_data)参数
             should_stop_callback: 停止检查回调函数，返回True表示应该停止处理
+            retain_dataset_cite: 是否保留数据集引用，默认为False
             
         Returns:
             str: AI回复内容
@@ -42,6 +43,7 @@ class AIChatService:
         try:
             data = {
                 "chatId": chat_id,
+                "responseChatItemId": chat_id,
                 "messages": [
                     {
                         "role": "user",
@@ -52,6 +54,10 @@ class AIChatService:
                 "stream": True,
                 "detail": True
             }
+            
+            # 只有在 retain_dataset_cite 为 True 时才添加这个字段 流式输出答案时会带引用 格式：[quote_id](CITE)
+            if retain_dataset_cite:
+                data["retainDatasetCite"] = True
             
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -153,6 +159,57 @@ class AIChatService:
                                             else:
                                                 # 保存为待发送（覆盖之前的）
                                                 pending_status = status_content
+                                
+                                elif current_event == "toolCall":
+                                    # 处理工具调用事件
+                                    tool_info = data_obj.get("tool", {})
+                                    tool_name = tool_info.get("toolName", "")
+                                    function_name = tool_info.get("functionName", "")
+                                    tool_id = tool_info.get("id", "")
+                                    
+                                    if tool_name:
+                                        # 检查是否有未完成的答案更新
+                                        if pending_answer and on_answer_callback:
+                                            task = asyncio.create_task(on_answer_callback(pending_answer))
+                                            pending_tasks.append(task)
+                                            pending_answer = None  # 清除待发送
+                                        
+                                        logger.info(f"工具调用: {tool_name} (ID: {tool_id})")
+                                        
+                                        # 构建工具调用状态内容
+                                        status_content = f"🔧 **工具调用**: {tool_name}..."
+                                        
+                                        # 频率控制：立即发送或保存待发送
+                                        current_time = time.time()
+                                        if on_status_callback:
+                                            if (current_time - last_status_update) >= callback_interval:
+                                                # 立即发送
+                                                last_status_update = current_time
+                                                task = asyncio.create_task(on_status_callback(status_content))
+                                                pending_tasks.append(task)
+                                                pending_status = None  # 清除待发送
+                                            else:
+                                                # 保存为待发送（覆盖之前的）
+                                                pending_status = status_content
+                                
+                                elif current_event == "toolParams":
+                                    # 处理工具参数事件（不显示给用户，只做日志记录）
+                                    tool_info = data_obj.get("tool", {})
+                                    tool_id = tool_info.get("id", "")
+                                    params = tool_info.get("params", "")
+                                    
+                                    # 参数详情(流式响应 日志较多)
+                                    # logger.debug(f"工具参数更新 (ID: {tool_id}): {params[:100]}{'...' if len(params) > 100 else ''}")
+                                
+                                elif current_event == "toolResponse":
+                                    # 处理工具响应事件（不显示给用户，只做日志记录）
+                                    tool_info = data_obj.get("tool", {})
+                                    tool_id = tool_info.get("id", "")
+                                    response = tool_info.get("response", "")
+                                    
+                                    # 只在debug级别记录响应概要
+                                    # response_preview = response[:200] + "..." if len(response) > 200 else response
+                                    # logger.debug(f"工具响应完成 (ID: {tool_id}): {response_preview}")
                                 
                                 # 处理思考过程和实际答案内容
                                 elif current_event == "answer" or "choices" in data_obj:

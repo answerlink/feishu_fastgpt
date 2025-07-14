@@ -35,6 +35,7 @@
             "aichat_enable": true,
             "aichat_url": "http://127.0.0.1:3000/api/v1/chat/completions",
             "aichat_key": "fastgpt-ipUSgnlYvxxx",
+            "aichat_app_id": "685235fxxx",
             "aichat_support_stop_streaming": false,
             "aichat_client_download_host": "http://127.0.0.1:3000",
             "aichat_read_collection_url": "https://xxx/api/core/dataset/collection/read",

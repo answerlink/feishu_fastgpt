@@ -157,7 +157,11 @@
               style="width: 100%"
               border
             >
-              <el-table-column prop="title" label="文档标题" min-width="150" />
+              <el-table-column label="文档标题" min-width="150">
+                <template #default="scope">
+                  <span>{{ scope.row.title }}<span v-if="scope.row.file_token" class="token-suffix">({{ scope.row.file_token }})</span></span>
+                </template>
+              </el-table-column>
               <el-table-column prop="file_token" label="文档Token" min-width="180" show-overflow-tooltip />
               <el-table-column prop="file_type" label="类型" width="100" />
               <el-table-column label="文档最后编辑时间" width="180">
@@ -680,5 +684,12 @@ h4 {
 
 .no-data {
   padding: 40px 0;
+}
+
+.token-suffix {
+  color: #909399;
+  font-size: 12px;
+  margin-left: 8px;
+  font-weight: normal;
 }
 </style> 

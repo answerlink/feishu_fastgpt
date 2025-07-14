@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     v-model="visible"
-    :title="title"
+    :title="displayTitle"
     width="80%"
     :fullscreen="fullscreen"
     :before-close="handleClose"
@@ -74,6 +74,10 @@ const visible = computed({
   set: (val) => emit('update:modelValue', val)
 })
 
+const displayTitle = computed(() => {
+  return props.docToken ? `${props.title} (${props.docToken})` : props.title
+})
+
 const content = ref('')
 const loading = ref(false)
 const fullscreen = ref(false)
@@ -136,7 +140,7 @@ const downloadMarkdown = () => {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `${props.title || '文档'}.md`
+  a.download = `${displayTitle.value || '文档'}.md`
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)

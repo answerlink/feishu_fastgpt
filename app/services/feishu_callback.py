@@ -506,6 +506,83 @@ class FeishuCallbackService:
                         else:
                             logger.warning(f"缺少必要参数，无法设置搜索偏好: app_id={app_id}, user_id={user_id}")
                     
+                    elif event_key.startswith("bot_select_model_"):
+                        # 处理模型选择事件，解析模型名称和ID
+                        model_info = event_key[17:]  # 去掉 "bot_select_model_" 前缀
+                        
+                        # 解析 model_name 和 model_id（使用#分隔）
+                        if "#" in model_info:
+                            model_name, model_id = model_info.split("#", 1)
+                        else:
+                            # 如果没有#分隔符，使用整个字符串作为model_id，model_name也使用相同值
+                            model_name = model_info
+                            model_id = model_info
+                        
+                        logger.info(f"处理模型选择事件: {event_key}")
+                        logger.info(f"  用户 {user_id} (Open ID: {open_id}) 选择了模型")
+                        logger.info(f"  模型名称: {model_name}")
+                        logger.info(f"  模型ID: {model_id}")
+                        
+                        # 转换时间戳为可读格式
+                        if create_time:
+                            try:
+                                import datetime
+                                create_time_int = int(create_time)
+                                if create_time_int > 10**10:
+                                    create_time_int = create_time_int // 1000
+                                dt = datetime.datetime.fromtimestamp(create_time_int)
+                                logger.info(f"  事件发生时间: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                            except Exception as e:
+                                logger.warning(f"时间戳转换失败: {str(e)}")
+                        
+                        # 设置模型偏好
+                        if app_id and user_id and model_id:
+                            try:
+                                from app.services.user_search_preference_service import UserSearchPreferenceService
+                                
+                                # 获取应用名称和配置
+                                app_name = None
+                                app_secret = None
+                                for app in settings.FEISHU_APPS:
+                                    if app.app_id == app_id:
+                                        app_name = app.app_name
+                                        app_secret = app.app_secret
+                                        break
+                                
+                                # 设置模型偏好（存储model_id）
+                                preference_service = UserSearchPreferenceService()
+                                success = preference_service.set_model_preference(
+                                    app_id=app_id,
+                                    user_id=user_id,
+                                    model_id=model_id
+                                )
+                                
+                                if success:
+                                    logger.info(f"  已设置模型偏好:")
+                                    logger.info(f"    应用: {app_name or app_id}")
+                                    logger.info(f"    用户ID: {user_id}")
+                                    logger.info(f"    模型名称: {model_name}")
+                                    logger.info(f"    模型ID: {model_id}")
+                                    logger.info(f"    该偏好将应用于用户在此应用的所有会话")
+                                    
+                                    # 发送模型选择确认消息（传递model_name用于显示）
+                                    if app_secret:
+                                        try:
+                                            self._send_model_selection_confirmation_async(
+                                                app_id, app_secret, user_id, model_name, model_id, app_name
+                                            )
+                                        except Exception as msg_error:
+                                            logger.error(f"启动发送模型选择确认消息失败: {str(msg_error)}")
+                                else:
+                                    logger.error(f"设置模型偏好失败")
+                                
+                            except Exception as e:
+                                logger.error(f"处理模型选择失败: {str(e)}")
+                                import traceback
+                                logger.error(f"错误详情: {traceback.format_exc()}")
+                        else:
+                            logger.warning(f"缺少必要参数，无法设置模型偏好: app_id={app_id}, user_id={user_id}, model_id={model_id}")
+                    
                     else:
                         logger.info(f"处理其他机器人菜单事件: {event_key}")
                     
@@ -1159,6 +1236,145 @@ class FeishuCallbackService:
                     "tag": "plain_text"
                 },
                 "template": mode_data["color"]
+            },
+            "config": {
+                "enable_forward": True,
+                "width_mode": "fill"
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": markdown_content
+                    }
+                ]
+            }
+        }
+        
+        return card_content
+
+    def _send_model_selection_confirmation_async(self, app_id: str, app_secret: str, user_id: str, model_name: str, model_id: str, app_name: str = None) -> None:
+        """异步发送模型选择确认消息
+        
+        Args:
+            app_id: 应用ID
+            app_secret: 应用密钥
+            user_id: 用户ID
+            model_name: 模型显示名称
+            model_id: 模型ID
+            app_name: 应用名称
+        """
+        try:
+            import asyncio
+            import threading
+            
+            # 使用线程池执行器避免事件循环冲突
+            def run_message_sending():
+                try:
+                    # 创建独立的事件循环
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        # 运行异步发送
+                        loop.run_until_complete(self._send_model_selection_confirmation(app_id, app_secret, user_id, model_name, model_id, app_name))
+                    finally:
+                        # 确保循环正确关闭
+                        pending = asyncio.all_tasks(loop)
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.close()
+                        
+                except Exception as e:
+                    logger.error(f"线程中发送模型选择确认消息失败: {str(e)}")
+            
+            # 在独立线程中运行，避免事件循环冲突
+            thread = threading.Thread(target=run_message_sending, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            logger.error(f"启动发送模型选择确认消息失败: {str(e)}")
+
+    async def _send_model_selection_confirmation(self, app_id: str, app_secret: str, user_id: str, model_name: str, model_id: str, app_name: str = None) -> None:
+        """发送模型选择确认消息的具体逻辑
+        
+        Args:
+            app_id: 应用ID
+            app_secret: 应用密钥
+            user_id: 用户ID
+            model_name: 模型显示名称
+            model_id: 模型ID
+            app_name: 应用名称
+        """
+        try:
+            # 导入机器人服务
+            from app.services.feishu_bot import FeishuBotService
+            
+            # 创建机器人服务实例
+            bot_service = FeishuBotService(app_id, app_secret)
+            
+            # 构建模型选择确认卡片（使用model_name显示）
+            card_content = self._build_model_selection_confirmation_card(model_name, app_name)
+            
+            # 发送卡片消息给用户
+            success = await bot_service.send_card_message(
+                receive_id=user_id,
+                card_content=card_content,
+                receive_id_type="user_id"
+            )
+            
+            if success:
+                logger.info(f"模型选择确认卡片发送成功: user_id={user_id}, model_name={model_name}, model_id={model_id}")
+            else:
+                logger.warning(f"模型选择确认卡片发送失败: user_id={user_id}, model_name={model_name}, model_id={model_id}")
+                
+        except Exception as e:
+            logger.error(f"发送模型选择确认消息失败: {str(e)}")
+            import traceback
+            logger.error(f"错误详情: {traceback.format_exc()}")
+
+    def _build_model_selection_confirmation_card(self, model_name: str, app_name: str = None) -> dict:
+        """构建模型选择确认卡片
+        
+        Args:
+            model_name: 模型显示名称
+            app_name: 应用名称
+            
+        Returns:
+            dict: 飞书卡片内容
+        """
+        # 获取当前时间
+        from datetime import datetime
+        current_time = datetime.now().strftime("%H:%M")
+        
+        # 构建应用显示名称
+        if app_name:
+            app_display = app_name
+        else:
+            app_display = "AI助手"
+        
+        # 构建Markdown内容，直接使用传入的model_name
+        markdown_content = f"""---
+
+**✅ 模型已切换** `{current_time}`
+
+**🤖 {model_name}**
+
+现在将使用此模型为您提供服务
+
+---
+
+开始提问吧！我将使用新模型为您提供更优质的回答。"""
+        
+        # 构建卡片结构
+        card_content = {
+            "schema": "2.0",
+            "header": {
+                "title": {
+                    "content": f"🤖 模型设置",
+                    "tag": "plain_text"
+                },
+                "template": "orange"
             },
             "config": {
                 "enable_forward": True,
