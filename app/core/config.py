@@ -48,6 +48,7 @@ class Settings(BaseModel):
     APP_NAME: str = "feishu-plus"
     DEBUG: bool = False
     API_V1_STR: str = "/api/v1"
+    API_BASE_PATH: str = ""  # 后端代理的应用路径，可在config.json中配置
     
     # 数据库配置
     DB_HOST: str

@@ -393,6 +393,7 @@ class FeishuCallbackService:
                         if app_id and user_id:
                             try:
                                 from app.services.user_chat_session_service import UserChatSessionService
+                                from app.services.user_search_preference_service import UserSearchPreferenceService
                                 
                                 # 获取应用名称和配置
                                 app_name = None
@@ -416,6 +417,16 @@ class FeishuCallbackService:
                                 logger.info(f"    应用: {app_name or app_id}")
                                 logger.info(f"    用户ID: {user_id}")
                                 logger.info(f"    新Chat ID: {new_chat_id}")
+
+                                # 清除用户的模型偏好，使新会话使用下游默认模型
+                                try:
+                                    preference_service = UserSearchPreferenceService()
+                                    if preference_service.clear_model_preference(app_id=app_id, user_id=user_id):
+                                        logger.info(f"  已在新会话中清除模型偏好: user_id={user_id}")
+                                    else:
+                                        logger.warning(f"  清除模型偏好失败: user_id={user_id}")
+                                except Exception as clear_e:
+                                    logger.warning(f"清除模型偏好时出现异常: {str(clear_e)}")
                                 
                                 # 发送新会话分隔消息（异步执行）
                                 if app_secret:

@@ -6,6 +6,7 @@ import re
 import os
 import tempfile
 import shutil
+import uuid
 from typing import Dict, Any, Optional, List
 from app.core.config import settings
 from app.core.logger import setup_logger, setup_app_logger
@@ -991,7 +992,7 @@ class FeishuBotService:
                 "think_content": "",
                 "think_finished": False,
                 "answer_content": "",
-                "references_title": "📚 **知识库引用** (0)",
+                "references_title": "📚 **知识引用** (0)",
                 "references_content": "",
                 "bot_summary": "AI正在思考中...",  # 机器人问答状态
                 "image_cache": {},  # 添加图片缓存：{原始URL: 飞书img_key}
@@ -999,6 +1000,9 @@ class FeishuBotService:
                 "citation_cache": {},  # 添加引用缓存：{quote_id: 引用链接}
                 "processing_citations": set()  # 添加正在处理的引用ID集合
             }
+
+            # 预先生成本次会话的 chat item id，并用于引用预览
+            response_chat_item_id = str(uuid.uuid4())
             
             # 1. 创建流式卡片（不包含停止按钮）
             card_content = self._build_card_content(current_card_state)
@@ -1086,7 +1090,7 @@ class FeishuBotService:
                     # 再处理知识块引用
                     processed_think_text = await self._process_citations_in_text_with_cache(
                         processed_think_text, current_card_state["citation_cache"], current_card_state["processing_citations"],
-                        current_chat_id
+                        current_chat_id, response_chat_item_id
                     )
                     
                     # 使用处理后的文本
@@ -1159,7 +1163,7 @@ class FeishuBotService:
                     # 最后处理知识块引用
                     processed_answer_text = await self._process_citations_in_text_with_cache(
                         processed_answer_text, current_card_state["citation_cache"], current_card_state["processing_citations"],
-                        current_chat_id
+                        current_chat_id, response_chat_item_id
                     )
                     
                     # 使用处理后的文本
@@ -1242,7 +1246,7 @@ class FeishuBotService:
                         logger.info(f"收到 {len(references_data)} 条引用数据")
                         
                         # 更新卡片状态中的引用信息
-                        current_card_state["references_title"] = f"📚 **知识库引用** ({len(references_data)})"
+                        current_card_state["references_title"] = f"📚 **知识引用** ({len(references_data)})"
                         current_card_state["references_content"] = await self._get_references_content(references_data)
                     else:
                         logger.debug("引用数据为空，跳过更新")
@@ -1319,7 +1323,8 @@ class FeishuBotService:
                 on_answer_callback=on_answer_callback,
                 on_references_callback=on_references_callback,
                 should_stop_callback=should_stop,
-                retain_dataset_cite=has_aichat_app_id
+                retain_dataset_cite=has_aichat_app_id,
+                response_chat_item_id=response_chat_item_id
             )
             
             # 检查是否被用户停止
@@ -1803,18 +1808,24 @@ class FeishuBotService:
 {content_preview}
 ```"""
                 
-                # 如果有collection_id，尝试获取下载链接
+                # 如果有collection_id，判断是否为链接或需要获取下载链接
                 if collection_id:
-                    try:
-                        download_url = await self.get_collection_download_url(collection_id)
-                        if download_url:
-                            # 使用飞书支持的HTML Link标签格式
-                            ref_content += f"\n\n🔗 <link url=\"{download_url}\">点击下载原文件</link>"
-                        else:
+                    # 检查是否为HTTP/HTTPS链接（博查联网检索等）
+                    if collection_id.startswith(('http://', 'https://')):
+                        # 直接使用链接，跳转到源站
+                        ref_content += f"\n\n🔗 <link url=\"{collection_id}\">点击跳转源站</link>"
+                    else:
+                        # 传统的collection_id，尝试获取下载链接
+                        try:
+                            download_url = await self.get_collection_download_url(collection_id)
+                            if download_url:
+                                # 使用飞书支持的HTML Link标签格式
+                                ref_content += f"\n\n🔗 <link url=\"{download_url}\">点击下载原文件</link>"
+                            else:
+                                ref_content += f"\n\n📄 文档ID: {collection_id}"
+                        except Exception as e:
+                            logger.warning(f"获取collection_id {collection_id} 下载链接失败: {str(e)}")
                             ref_content += f"\n\n📄 文档ID: {collection_id}"
-                    except Exception as e:
-                        logger.warning(f"获取collection_id {collection_id} 下载链接失败: {str(e)}")
-                        ref_content += f"\n\n📄 文档ID: {collection_id}"
                 
                 references_content += ref_content + "\n\n---\n\n"
             
@@ -2591,7 +2602,7 @@ class FeishuBotService:
             logger.error(f"处理图片链接异常: {str(e)}")
             return text  # 出错时返回原文本
     
-    async def _process_citations_in_text_with_cache(self, text: str, citation_cache: dict, processing_citations: set, chat_id: str) -> str:
+    async def _process_citations_in_text_with_cache(self, text: str, citation_cache: dict, processing_citations: set, chat_id: str, chat_item_data_id: str) -> str:
         """处理文本中的知识块引用，使用缓存避免重复处理
         
         简化后的处理流程：
@@ -2610,8 +2621,13 @@ class FeishuBotService:
             str: 处理后的文本，知识块引用已替换为预览链接
         """
         try:
-            # 匹配知识块引用格式：[quote_id](CITE)
-            citation_pattern = r'\[([a-f0-9]{24})\]\(CITE\)'
+            # 统一处理引用格式，支持多种格式兼容：
+            # 1. [quote_id](CITE) - 标准格式
+            # 2. 【quote_id】(CITE) - 中文括号格式  
+            # 3. 【quote_id】- 中文括号且缺少CITE标记
+            # 4. [quote_id] - 英文括号且缺少CITE标记
+            # 统一输出为：[quote_id](CITE) 格式
+            citation_pattern = r'[\[【]([a-f0-9]{24})[\]】](\(CITE\))*'
             matches = re.finditer(citation_pattern, text)
             
             # 存储需要替换的内容
@@ -2644,7 +2660,7 @@ class FeishuBotService:
                 
                 try:
                     # 直接构建预览URL，包含必要的参数
-                    preview_url = await self._create_quote_preview_url(quote_id, chat_id)
+                    preview_url = await self._create_quote_preview_url(quote_id, chat_id, chat_item_data_id)
                     if preview_url:
                         new_link = f"[📌]({preview_url})"
                         replacements.append((full_match, new_link))
@@ -2671,7 +2687,7 @@ class FeishuBotService:
             logger.error(f"处理知识块引用异常: {str(e)}")
             return text  # 出错时返回原文本
     
-    async def _create_quote_preview_url(self, quote_id: str, chat_id: str) -> Optional[str]:
+    async def _create_quote_preview_url(self, quote_id: str, chat_id: str, chat_item_data_id: str) -> Optional[str]:
         """创建知识块预览URL（简化版，直接传递参数）
         
         Args:
@@ -2693,7 +2709,7 @@ class FeishuBotService:
             app_id_for_preview = getattr(self.app_config, 'aichat_app_id', '')
             
             # 直接构建预览URL，将参数传递给前端页面
-            preview_url = f"{base_url.rstrip('/')}/api/v1/collection-viewer/view-quote/{quote_id}?app_id={app_id_for_preview}&chat_id={chat_id}"
+            preview_url = f"{base_url.rstrip('/')}/api/v1/collection-viewer/view-quote/{quote_id}?app_id={app_id_for_preview}&chat_id={chat_id}&chat_item_data_id={chat_item_data_id}"
             
             logger.info(f"创建知识块预览URL: {preview_url}")
             return preview_url

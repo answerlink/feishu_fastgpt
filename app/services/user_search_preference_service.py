@@ -160,6 +160,36 @@ class UserSearchPreferenceService:
             logger.error(f"获取用户偏好失败: {str(e)}")
             # 如果数据库操作失败，返回默认值
             return True, False, None
+
+    def clear_model_preference(self, app_id: str, user_id: str) -> bool:
+        """清除用户的模型偏好（将 model_id 置为空）
+        
+        Args:
+            app_id: 应用ID
+            user_id: 用户ID
+        
+        Returns:
+            bool: 是否清除成功（无记录也视为成功）
+        """
+        try:
+            with self.Session() as session:
+                query = select(UserSearchPreference).where(
+                    UserSearchPreference.app_id == app_id,
+                    UserSearchPreference.user_id == user_id
+                )
+                preference = session.execute(query).scalar_one_or_none()
+                if preference:
+                    preference.model_id = None
+                    preference.updated_at = datetime.utcnow()
+                    session.commit()
+                    logger.info(f"清除模型偏好: app_id={app_id}, user_id={user_id}")
+                else:
+                    # 若不存在记录，不视为错误
+                    logger.info(f"未找到用户偏好记录，无需清除模型偏好: app_id={app_id}, user_id={user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"清除模型偏好失败: {str(e)}")
+            return False
     
     def get_search_mode_info(self, app_id: str, user_id: str) -> Optional[dict]:
         """获取搜索模式的详细信息

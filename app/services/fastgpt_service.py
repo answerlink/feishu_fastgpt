@@ -275,6 +275,7 @@ class FastGPTService:
             "chunkSize": chunk_size,
             "chunkSplitter": "",
             "qaPrompt": "",
+            "indexPrefixTitle": True,  # 使用标题做索引前缀
             "metadata": {}  # 使用空对象
         }
         

@@ -13,6 +13,9 @@ logger = setup_logger("collection_viewer")
 
 router = APIRouter()
 
+# API基础路径配置
+API_BASE_PATH = settings.API_BASE_PATH
+
 class CollectionData(BaseModel):
     """知识块数据模型"""
     collection: Dict[str, Any]
@@ -80,7 +83,7 @@ async def get_collection_download_url_direct(collection_id: str, app_config) -> 
         logger.error(f"获取collection下载链接异常: {str(e)}")
         return None
 
-async def get_quote_data_from_fastgpt(quote_id: str, app_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+async def get_quote_data_from_fastgpt(quote_id: str, app_id: str, chat_id: str, chat_item_data_id: str) -> Optional[Dict[str, Any]]:
     """从FastGPT获取知识块数据
     
     Args:
@@ -137,10 +140,10 @@ async def get_quote_data_from_fastgpt(quote_id: str, app_id: str, chat_id: str) 
             "id": quote_id,
             "appId": app_id,
             "chatId": chat_id,
-            "chatItemDataId": chat_id
+            "chatItemDataId": chat_item_data_id
         }
         
-        logger.info(f"从FastGPT获取知识块数据: quote_id={quote_id}, app_id={app_id}, chat_id={chat_id}")
+        logger.info(f"从FastGPT获取知识块数据: quote_id={quote_id}, app_id={app_id}, chat_id={chat_id}, chat_item_data_id={chat_item_data_id}")
         logger.info(f"使用URL: {url}")
         logger.info(f"请求数据: {body_data}")
         
@@ -458,7 +461,7 @@ async def view_collection(collection_id: str):
             try {{
                 document.getElementById('loading').style.display = 'block';
                 
-                const response = await fetch(`/api/v1/collection-viewer/info/{collection_id}`);
+                const response = await fetch(`{API_BASE_PATH}/api/v1/collection-viewer/info/{collection_id}`);
                 const result = await response.json();
                 
                 if (result.code === 200) {{
@@ -534,7 +537,7 @@ async def view_collection(collection_id: str):
                 
                 showDownloadStatus('正在获取下载链接...', 'info');
                 
-                const response = await fetch(`/api/v1/collection-viewer/download/{collection_id}`);
+                const response = await fetch(`{API_BASE_PATH}/api/v1/collection-viewer/download/{collection_id}`);
                 const result = await response.json();
                 
                 if (result.code === 200 && result.data && result.data.download_url) {{
@@ -581,7 +584,7 @@ async def view_collection(collection_id: str):
         raise HTTPException(status_code=500, detail=f"生成页面失败: {str(e)}")
 
 @router.get("/view-quote/{quote_id}", response_class=HTMLResponse)
-async def view_quote(quote_id: str, app_id: str = Query(..., description="应用ID"), chat_id: str = Query(..., description="聊天ID")):
+async def view_quote(quote_id: str, app_id: str = Query(..., description="应用ID"), chat_id: str = Query(..., description="聊天ID"), chat_item_data_id: str = Query(..., description="聊天项数据ID")):
     """展示知识块详情页面（直接从FastGPT获取数据）
     
     Args:
@@ -882,13 +885,18 @@ async def view_quote(quote_id: str, app_id: str = Query(..., description="应用
         const quoteId = '{quote_id}';
         const appId = '{app_id}';
         const chatId = '{chat_id}';
+        const chatItemDataId = '{chat_item_data_id}';
+        
+        // 存储知识块信息，避免重复请求
+        let quoteData = null;
         
         async function loadQuoteInfo() {{
             try {{
-                const response = await fetch(`/api/v1/collection-viewer/quote-info/${{quoteId}}?app_id=${{appId}}&chat_id=${{chatId}}`);
+                const response = await fetch(`{API_BASE_PATH}/api/v1/collection-viewer/quote-info/${{quoteId}}?app_id=${{appId}}&chat_id=${{chatId}}&chat_item_data_id=${{chatItemDataId}}`);
                 const result = await response.json();
                 
                 if (result.code === 200 && result.data) {{
+                    quoteData = result.data;  // 缓存数据
                     displayQuoteInfo(result.data);
                 }} else {{
                     showError(result.msg || '获取知识块信息失败');
@@ -906,7 +914,6 @@ async def view_quote(quote_id: str, app_id: str = Query(..., description="应用
             
             loadingEl.style.display = 'none';
             infoEl.style.display = 'block';
-            downloadEl.style.display = 'block';
             
             // 显示文档信息
             const collection = data.collection || {{}};
@@ -931,6 +938,26 @@ async def view_quote(quote_id: str, app_id: str = Query(..., description="应用
                 answerBox.style.display = 'block';
                 answerContent.textContent = data.a;
             }}
+            
+            // 根据数据情况动态显示按钮
+            const downloadBtn = document.getElementById('downloadBtn');
+            const hasCollection = collection && Object.keys(collection).length > 0 && collection._id;
+            const hasExternalUrl = data.a && data.a.trim() && (data.a.startsWith('http://') || data.a.startsWith('https://'));
+            
+            if (hasCollection) {{
+                // 有集合信息，显示下载原文件按钮
+                downloadEl.style.display = 'block';
+                downloadBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7,10 12,15 17,10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> 下载原文件';
+                downloadBtn.onclick = downloadFile;
+            }} else if (hasExternalUrl) {{
+                // 没有集合信息但有外部链接，显示跳转源站按钮
+                downloadEl.style.display = 'block';
+                downloadBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> 点击跳转源站';
+                downloadBtn.onclick = function() {{ window.open(data.a, '_blank'); }};
+            }} else {{
+                // 既没有集合信息也没有外部链接，隐藏按钮
+                downloadEl.style.display = 'none';
+            }}
         }}
         
         function showError(message) {{
@@ -953,20 +980,17 @@ async def view_quote(quote_id: str, app_id: str = Query(..., description="应用
             statusEl.className = 'loading';
             
             try {{
-                // 从知识块信息中获取collection_id
-                const infoResponse = await fetch(`/api/v1/collection-viewer/quote-info/${{quoteId}}?app_id=${{appId}}&chat_id=${{chatId}}`);
-                const infoResult = await infoResponse.json();
-                
-                if (infoResult.code !== 200 || !infoResult.data || !infoResult.data.collection) {{
-                    throw new Error('无法获取文件信息');
+                // 使用缓存的知识块信息，避免重复请求
+                if (!quoteData || !quoteData.collection) {{
+                    throw new Error('知识块信息未加载，请刷新页面重试');
                 }}
                 
-                const collectionId = infoResult.data.collection._id;
+                const collectionId = quoteData.collection._id;
                 if (!collectionId) {{
                     throw new Error('文件ID不存在');
                 }}
                 
-                const downloadResponse = await fetch(`/api/v1/collection-viewer/download/${{collectionId}}?app_id=${{appId}}`);
+                const downloadResponse = await fetch(`{API_BASE_PATH}/api/v1/collection-viewer/download/${{collectionId}}?app_id=${{appId}}`);
                 const downloadResult = await downloadResponse.json();
                 
                 if (downloadResult.code === 200 && downloadResult.data && downloadResult.data.download_url) {{
@@ -1007,7 +1031,7 @@ async def view_quote(quote_id: str, app_id: str = Query(..., description="应用
         raise HTTPException(status_code=500, detail=f"生成页面失败: {str(e)}")
 
 @router.get("/quote-info/{quote_id}")
-async def get_quote_info(quote_id: str, app_id: str = Query(..., description="应用ID"), chat_id: str = Query(..., description="聊天ID")):
+async def get_quote_info(quote_id: str, app_id: str = Query(..., description="应用ID"), chat_id: str = Query(..., description="聊天ID"), chat_item_data_id: str = Query(..., description="聊天项数据ID")):
     """获取知识块信息（从FastGPT获取）
     
     Args:
@@ -1020,7 +1044,7 @@ async def get_quote_info(quote_id: str, app_id: str = Query(..., description="�
     """
     try:
         # 从FastGPT获取知识块数据
-        quote_data = await get_quote_data_from_fastgpt(quote_id, app_id, chat_id)
+        quote_data = await get_quote_data_from_fastgpt(quote_id, app_id, chat_id, chat_item_data_id)
         
         if quote_data:
             return JSONResponse(content={

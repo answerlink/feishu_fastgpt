@@ -80,7 +80,7 @@ class UserChatSessionService:
                 return f"feishu_{app_id}_user_{user_id}"
     
     def get_current_chat_id(self, app_id: str, user_id: str, app_name: str = None) -> str:
-        """获取用户当前的活跃chat_id
+        """获取用户当前的活跃chat_id，如果跨天则自动重置
         
         Args:
             app_id: 应用ID
@@ -100,8 +100,33 @@ class UserChatSessionService:
                 user_session = session.execute(query).scalar_one_or_none()
                 
                 if user_session and user_session.current_chat_id:
-                    logger.debug(f"找到用户会话: app_id={app_id}, user_id={user_id}, chat_id={user_session.current_chat_id}")
-                    return user_session.current_chat_id
+                    # 检查是否跨天，如果跨天则自动重置chatId
+                    current_date = datetime.utcnow().date()
+                    session_date = user_session.session_start_time.date()
+                    
+                    if current_date != session_date:
+                        # 跨天了，自动生成新的chatId
+                        logger.info(f"检测到跨天，自动重置chatId: app_id={app_id}, user_id={user_id}, 原日期={session_date}, 当前日期={current_date}")
+                        
+                        # 生成新的chat_id
+                        timestamp = int(time.time())
+                        if app_name:
+                            new_chat_id = f"feishu_{app_name}_user_{user_id}_{timestamp}"
+                        else:
+                            new_chat_id = f"feishu_{app_id}_user_{user_id}_{timestamp}"
+                        
+                        # 更新会话记录
+                        user_session.current_chat_id = new_chat_id
+                        user_session.session_start_time = datetime.utcnow()
+                        user_session.updated_at = datetime.utcnow()
+                        session.commit()
+                        
+                        logger.info(f"已自动重置chatId: {new_chat_id}")
+                        return new_chat_id
+                    else:
+                        # 同一天，返回现有的chatId
+                        logger.debug(f"找到用户会话: app_id={app_id}, user_id={user_id}, chat_id={user_session.current_chat_id}")
+                        return user_session.current_chat_id
                 else:
                     # 如果没有找到会话记录，返回传统格式的chat_id
                     if app_name:

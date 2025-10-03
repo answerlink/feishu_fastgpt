@@ -2,6 +2,7 @@
     "APP_NAME": "feishu-plus",
     "DEBUG": true,
     "API_V1_STR": "/api/v1",
+    "API_BASE_PATH": "",
 
     "DB_HOST": "localhost",
     "DB_PORT": 3306,

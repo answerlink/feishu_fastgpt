@@ -7,6 +7,9 @@ VLM (Vision Language Model) 服务工具类
 
 import aiohttp
 import base64
+import hashlib
+import json
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 from app.core.logger import setup_logger
@@ -33,6 +36,8 @@ class VLMService:
         self.model = getattr(self.app_config, 'image_bed_vlm_model', '')
         self.prompt = getattr(self.app_config, 'image_bed_vlm_model_prompt', '请用20字以内简洁描述这张图片内容，不要加任何前缀，直接给出描述，参考论文引用图例的格式。')
         
+        # 缓存文件路径
+        self.cache_file = Path("temp/vlm_cache.json")
         self._client = None
     
     @property
@@ -59,6 +64,67 @@ class VLMService:
             self.model,
             self.prompt
         ])
+    
+    def _load_cache(self) -> Dict[str, str]:
+        """加载缓存文件
+        
+        Returns:
+            Dict[str, str]: 图片路径到描述的映射
+        """
+        try:
+            if not self.cache_file.exists():
+                return {}
+            
+            with open(self.cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+                return cache_data.get('descriptions', {})
+        except Exception as e:
+            logger.warning(f"加载VLM缓存失败: {str(e)}")
+            return {}
+    
+    def _save_cache(self, cache_data: Dict[str, str]) -> None:
+        """保存缓存文件
+        
+        Args:
+            cache_data: 图片路径到描述的映射
+        """
+        try:
+            # 确保目录存在
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 保存缓存数据
+            cache_content = {
+                'descriptions': cache_data,
+                'last_updated': str(Path().cwd())  # 可以添加时间戳等元数据
+            }
+            
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_content, f, ensure_ascii=False, indent=2)
+                
+        except Exception as e:
+            logger.warning(f"保存VLM缓存失败: {str(e)}")
+    
+    def _get_cache_key(self, image_path: str) -> str:
+        """生成缓存键（图片内容哈希）
+        
+        Args:
+            image_path: 图片路径
+            
+        Returns:
+            str: 基于图片内容的SHA256哈希
+        """
+        try:
+            image_file = Path(image_path)
+            if not image_file.exists():
+                return str(image_file)
+            hasher = hashlib.sha256()
+            with open(image_file, 'rb') as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception:
+            # 退化为路径，确保不抛异常
+            return str(image_path)
     
     def _encode_image_to_base64(self, image_path: str) -> Optional[str]:
         """将图片文件编码为base64
@@ -98,7 +164,7 @@ class VLMService:
             return None
     
     async def get_image_description(self, image_path: str) -> Optional[str]:
-        """获取图片描述
+        """获取图片描述（带缓存）
         
         Args:
             image_path: 图片文件路径
@@ -109,6 +175,15 @@ class VLMService:
         if not self.is_enabled():
             logger.debug("VLM服务未启用，跳过图片描述获取")
             return None
+        
+        # 检查缓存
+        cache_key = self._get_cache_key(image_path)
+        cache_data = self._load_cache()
+        
+        if cache_key in cache_data:
+            cached_description = cache_data[cache_key]
+            logger.debug(f"使用缓存图片描述: {image_path} -> {cached_description}")
+            return cached_description
         
         try:
             # 编码图片
@@ -163,6 +238,12 @@ class VLMService:
                 if "choices" in result and len(result["choices"]) > 0:
                     description = result["choices"][0]["message"]["content"].strip()
                     logger.info(f"成功获取图片描述: {image_path} -> {description}")
+                    
+                    # 保存到缓存
+                    cache_data[cache_key] = description
+                    self._save_cache(cache_data)
+                    logger.debug(f"已保存图片描述到缓存: {image_path}")
+                    
                     return description
                 else:
                     logger.error(f"VLM API响应格式异常: {result}")

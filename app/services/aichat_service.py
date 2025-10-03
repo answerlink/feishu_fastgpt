@@ -4,6 +4,7 @@ import asyncio
 from typing import Dict, Any, List
 from app.core.logger import setup_logger
 import time
+import uuid
 
 logger = setup_logger("aichat_service")
 
@@ -24,7 +25,8 @@ class AIChatService:
     
     async def chat_completion_streaming(self, message: List[Dict[str, Any]], variables: Dict[str, Any] = None, chat_id: str = None,
                                                on_status_callback=None, on_think_callback=None, on_answer_callback=None,
-                                               on_references_callback=None, should_stop_callback=None, retain_dataset_cite: bool = False) -> str:
+                                               on_references_callback=None, should_stop_callback=None, retain_dataset_cite: bool = False,
+                                               response_chat_item_id: str = None) -> str:
         """调用AI Chat接口获取回复（支持状态、思考和答案的分离回调，支持多模态）
         
         Args:
@@ -36,6 +38,7 @@ class AIChatService:
             on_references_callback: 引用数据回调函数，接收(references_data)参数
             should_stop_callback: 停止检查回调函数，返回True表示应该停止处理
             retain_dataset_cite: 是否保留数据集引用，默认为False
+            response_chat_item_id: 响应的chat item id 用于引用预览鉴权
             
         Returns:
             str: AI回复内容
@@ -43,7 +46,7 @@ class AIChatService:
         try:
             data = {
                 "chatId": chat_id,
-                "responseChatItemId": chat_id,
+                "responseChatItemId": response_chat_item_id,
                 "messages": [
                     {
                         "role": "user",
@@ -282,8 +285,8 @@ class AIChatService:
                                     all_references = []  # 收集所有引用数据
                                     
                                     for flow_response in data_obj:
-                                        # 过滤出知识库节点
-                                        if flow_response.get("moduleType") == "datasetSearchNode":
+                                        # 过滤出知识库节点 或 博查联网搜索
+                                        if flow_response.get("moduleType") == "datasetSearchNode" or flow_response.get("moduleType") == "bochaWebSearch":
                                             # logger.info(f"知识库节点响应: {json.dumps(flow_response, ensure_ascii=False, indent=2)}")
                                             
                                             # 提取关键信息
