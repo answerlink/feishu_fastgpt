@@ -79,14 +79,15 @@ class UserChatSessionService:
             else:
                 return f"feishu_{app_id}_user_{user_id}"
     
-    def get_current_chat_id(self, app_id: str, user_id: str, app_name: str = None) -> str:
+    def get_current_chat_id(self, app_id: str, user_id: str, app_name: str = None, open_id: str = None) -> str:
         """获取用户当前的活跃chat_id，如果跨天则自动重置
-        
+
         Args:
             app_id: 应用ID
             user_id: 用户ID
             app_name: 应用名称（用于生成fallback chat_id）
-        
+            open_id: 用户Open ID（可选，用于创建新会话时保存）
+
         Returns:
             str: 当前活跃的chat_id
         """
@@ -98,29 +99,29 @@ class UserChatSessionService:
                     UserChatSession.user_id == user_id
                 )
                 user_session = session.execute(query).scalar_one_or_none()
-                
+
                 if user_session and user_session.current_chat_id:
                     # 检查是否跨天，如果跨天则自动重置chatId
                     current_date = datetime.utcnow().date()
                     session_date = user_session.session_start_time.date()
-                    
+
                     if current_date != session_date:
                         # 跨天了，自动生成新的chatId
                         logger.info(f"检测到跨天，自动重置chatId: app_id={app_id}, user_id={user_id}, 原日期={session_date}, 当前日期={current_date}")
-                        
+
                         # 生成新的chat_id
                         timestamp = int(time.time())
                         if app_name:
                             new_chat_id = f"feishu_{app_name}_user_{user_id}_{timestamp}"
                         else:
                             new_chat_id = f"feishu_{app_id}_user_{user_id}_{timestamp}"
-                        
+
                         # 更新会话记录
                         user_session.current_chat_id = new_chat_id
                         user_session.session_start_time = datetime.utcnow()
                         user_session.updated_at = datetime.utcnow()
                         session.commit()
-                        
+
                         logger.info(f"已自动重置chatId: {new_chat_id}")
                         return new_chat_id
                     else:
@@ -128,15 +129,32 @@ class UserChatSessionService:
                         logger.debug(f"找到用户会话: app_id={app_id}, user_id={user_id}, chat_id={user_session.current_chat_id}")
                         return user_session.current_chat_id
                 else:
-                    # 如果没有找到会话记录，返回传统格式的chat_id
+                    # 如果没有找到会话记录，自动创建新会话记录
+                    logger.info(f"未找到用户会话记录，自动创建新会话: app_id={app_id}, user_id={user_id}")
+
+                    # 生成新的chat_id
+                    timestamp = int(time.time())
                     if app_name:
-                        fallback_chat_id = f"feishu_{app_name}_user_{user_id}"
+                        new_chat_id = f"feishu_{app_name}_user_{user_id}_{timestamp}"
                     else:
-                        fallback_chat_id = f"feishu_{app_id}_user_{user_id}"
-                    
-                    logger.info(f"未找到用户会话记录，使用fallback chat_id: {fallback_chat_id}")
-                    return fallback_chat_id
-                    
+                        new_chat_id = f"feishu_{app_id}_user_{user_id}_{timestamp}"
+
+                    session_start_time = datetime.utcnow()
+
+                    # 创建新记录
+                    new_session = UserChatSession(
+                        app_id=app_id,
+                        user_id=user_id,
+                        open_id=open_id,
+                        current_chat_id=new_chat_id,
+                        session_start_time=session_start_time
+                    )
+                    session.add(new_session)
+                    session.commit()
+
+                    logger.info(f"已自动创建新会话: chat_id={new_chat_id}")
+                    return new_chat_id
+
         except Exception as e:
             logger.error(f"获取聊天会话失败: {str(e)}")
             # 如果数据库操作失败，返回传统格式的chat_id作为fallback

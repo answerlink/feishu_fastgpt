@@ -41,6 +41,7 @@ class FeishuApp(BaseModel):
     aichat_reply_p2p: Optional[bool] = True  # 是否在私聊中回复
     aichat_reply_group: Optional[bool] = False  # 是否在群聊中回复
     user_memory_enable: Optional[bool] = True  # 是否启用用户记忆功能
+    user_display_name_mode: Optional[str] = "name_with_en_name"  # 用户名显示模式: "name_only" 或 "name_with_en_name"
 
 class Settings(BaseModel):
     """应用配置"""

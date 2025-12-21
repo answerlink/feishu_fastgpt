@@ -106,6 +106,45 @@ class FastGPTService:
             
         return result
     
+    async def delete_folder(self, folder_id: str) -> dict:
+        """删除知识库文件夹
+        
+        Args:
+            folder_id: 文件夹ID
+            
+        Returns:
+            dict: 删除结果
+        """
+        try:
+            # 使用DELETE方法删除文件夹，传递ID参数
+            url = f"{self.base_url}/api/core/dataset/delete"
+            params = {"id": folder_id}
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            
+            async with self.client.delete(url, params=params, headers=headers) as response:
+                result = await response.json()
+                if result.get("code") == 200:
+                    logger.info(f"成功删除知识库文件夹: ID={folder_id}")
+                    return {
+                        "code": 200,
+                        "msg": "删除文件夹成功"
+                    }
+                else:
+                    logger.error(f"删除知识库文件夹失败: ID={folder_id}, 错误: {result.get('message')}")
+                    return {
+                        "code": -1,
+                        "msg": f"删除文件夹失败: {result.get('message', '未知错误')}"
+                    }
+        except Exception as e:
+            logger.error(f"删除知识库文件夹异常: ID={folder_id}, 错误: {str(e)}")
+            return {
+                "code": -1,
+                "msg": f"删除文件夹异常: {str(e)}"
+            }
+    
     async def create_dataset(self, name: str, intro: str = "", parent_id: str = None) -> dict:
         """创建知识库
         

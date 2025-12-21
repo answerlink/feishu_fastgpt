@@ -926,15 +926,25 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
             # 查询根目录下是否有app_name同名文件夹
             list_result = await fastgpt_service.get_dataset_list()
             
+            # 如果API请求失败，直接中断任务
+            if list_result.get("code") != 200:
+                error_msg = list_result.get("message", "未知错误")
+                logger.error(f"🚨 FastGPT API请求失败，中断任务: {error_msg}")
+                await fastgpt_service.close()
+                return {
+                    "code": -1,
+                    "msg": f"FastGPT API请求失败，任务中断: {error_msg}",
+                    "data": None
+                }
+            
             root_folder_id = None
-            if list_result.get("code") == 200:
-                # 查找同名文件夹
-                items = list_result.get("data", [])
-                for item in items:
-                    if item.get("name") == root_folder_name and item.get("type") == "folder":
-                        root_folder_id = item.get("_id")
-                        logger.info(f"找到已存在的根文件夹: {root_folder_name}, ID: {root_folder_id}")
-                        break
+            # 查找同名文件夹
+            items = list_result.get("data", [])
+            for item in items:
+                if item.get("name") == root_folder_name and item.get("type") == "folder":
+                    root_folder_id = item.get("_id")
+                    logger.info(f"找到已存在的根文件夹: {root_folder_name}, ID: {root_folder_id}")
+                    break
             
             # 如果没有找到同名文件夹，则创建
             if not root_folder_id:
@@ -977,14 +987,24 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
             # 查询在根文件夹下是否已有知识空间文件夹
             wiki_folders_result = await fastgpt_service.get_dataset_list(parent_id=root_folder_id)
             
-            if wiki_folders_result.get("code") == 200:
-                # 查找同名知识空间文件夹
-                items = wiki_folders_result.get("data", [])
-                for item in items:
-                    if item.get("name") == wiki_folder_name and item.get("type") == "folder":
-                        wiki_folder_id = item.get("_id")
-                        logger.info(f"找到已存在的知识空间文件夹: {wiki_folder_name}, ID: {wiki_folder_id}")
-                        break
+            # 如果API请求失败，直接中断任务
+            if wiki_folders_result.get("code") != 200:
+                error_msg = wiki_folders_result.get("message", "未知错误")
+                logger.error(f"🚨 FastGPT API请求失败，中断任务: {error_msg}")
+                await fastgpt_service.close()
+                return {
+                    "code": -1,
+                    "msg": f"FastGPT API请求失败，任务中断: {error_msg}",
+                    "data": None
+                }
+            
+            # 查找同名知识空间文件夹
+            items = wiki_folders_result.get("data", [])
+            for item in items:
+                if item.get("name") == wiki_folder_name and item.get("type") == "folder":
+                    wiki_folder_id = item.get("_id")
+                    logger.info(f"找到已存在的知识空间文件夹: {wiki_folder_name}, ID: {wiki_folder_id}")
+                    break
             
             # 如果没有找到知识空间文件夹，则创建
             if not wiki_folder_id:
@@ -1031,13 +1051,24 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                         # 查询在知识空间文件夹下是否已有该一级目录对应的知识库
                         datasets_result = await fastgpt_service.get_dataset_list(parent_id=wiki_folder_id)
                         
-                        if datasets_result.get("code") == 200:
-                            items = datasets_result.get("data", [])
-                            for item in items:
-                                if item.get("name") == first_level_dataset_name and item.get("type") == "dataset":
-                                    first_level_dataset_id = item.get("_id")
-                                    logger.info(f"找到已存在的一级目录知识库: {first_level_dataset_name}, ID: {first_level_dataset_id}")
-                                    break
+                        # 如果API请求失败，直接中断任务
+                        if datasets_result.get("code") != 200:
+                            error_msg = datasets_result.get("message", "未知错误")
+                            logger.error(f"🚨 FastGPT API请求失败，中断任务: {error_msg}")
+                            await fastgpt_service.close()
+                            return {
+                                "code": -1,
+                                "msg": f"FastGPT API请求失败，任务中断: {error_msg}",
+                                "data": None
+                            }
+                        
+                        # 查找同名知识库
+                        items = datasets_result.get("data", [])
+                        for item in items:
+                            if item.get("name") == first_level_dataset_name and item.get("type") == "dataset":
+                                first_level_dataset_id = item.get("_id")
+                                logger.info(f"找到已存在的一级目录知识库: {first_level_dataset_name}, ID: {first_level_dataset_id}")
+                                break
                         
                         # 如果没有找到，则创建知识库
                         if not first_level_dataset_id:
@@ -1112,28 +1143,34 @@ async def sync_document_to_aichat(request: SyncDocToAIChatRequest, feishu_servic
                             
                             # 步骤2：按文件名删除可能存在的重复文档
                             doc_title_for_dedup = doc.title or f"文档-{request.file_token}"
+                            dedup_filenames = [doc_title_for_dedup]
                             
-                            logger.info(f"[文件去重] 开始检查重复文档: filename={doc_title_for_dedup}, dataset_id={first_level_dataset_id}")
+                            # 如果原始标题没有后缀，补充 .md 版本，兼容FastGPT中自动追加的扩展名
+                            if not Path(doc_title_for_dedup).suffix:
+                                dedup_filenames.append(f"{doc_title_for_dedup}.md")
                             
-                            try:
-                                # 按文件名删除重复的文档
-                                dedup_result = await fastgpt_service.delete_collections_by_name(
-                                    dataset_id=first_level_dataset_id,
-                                    filename=doc_title_for_dedup,  # 直接使用完整文件名（包含扩展名）
-                                    parent_id=None
-                                )
+                            for dedup_filename in dedup_filenames:
+                                logger.info(f"[文件去重] 开始检查重复文档: filename={dedup_filename}, dataset_id={first_level_dataset_id}")
                                 
-                                if dedup_result.get("code") == 0:
-                                    deleted_count = dedup_result.get("deleted_count", 0)
-                                    if deleted_count > 0:
-                                        logger.info(f"[文件去重] 成功删除 {deleted_count} 个重复文档: {doc_title_for_dedup}")
+                                try:
+                                    # 按文件名删除重复的文档
+                                    dedup_result = await fastgpt_service.delete_collections_by_name(
+                                        dataset_id=first_level_dataset_id,
+                                        filename=dedup_filename,  # 直接使用完整文件名（包含扩展名）
+                                        parent_id=None
+                                    )
+                                    
+                                    if dedup_result.get("code") == 0:
+                                        deleted_count = dedup_result.get("deleted_count", 0)
+                                        if deleted_count > 0:
+                                            logger.info(f"[文件去重] 成功删除 {deleted_count} 个重复文档: {dedup_filename}")
+                                        else:
+                                            logger.info(f"[文件去重] 未发现重复文档: {dedup_filename}")
                                     else:
-                                        logger.info(f"[文件去重] 未发现重复文档: {doc_title_for_dedup}")
-                                else:
-                                    logger.warning(f"[文件去重] 去重检查失败: {dedup_result.get('msg')}")
-                            except Exception as e:
-                                logger.error(f"[文件去重] 执行去重时发生异常: {str(e)}")
-                                # 去重失败不影响后续上传流程，继续执行
+                                        logger.warning(f"[文件去重] 去重检查失败: {dedup_result.get('msg')}")
+                                except Exception as e:
+                                    logger.error(f"[文件去重] 执行去重时发生异常: {str(e)}")
+                                    # 去重失败不影响后续上传流程，继续执行
                             
                             if is_direct_file_upload:
                                 # 文件处理 - 直接上传原始文件

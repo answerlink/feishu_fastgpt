@@ -46,7 +46,8 @@
             "aichat_reply_p2p": true,
             "aichat_reply_group": true,
             "aichat_reply_group_trigger_mode": "at",
-            "user_memory_enable": true
+            "user_memory_enable": true,
+            "user_display_name_mode": "name_with_en_name"
         }
     ]
 

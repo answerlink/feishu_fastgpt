@@ -819,26 +819,34 @@ class FeishuBotService:
                     
                     if result.get("code") == 0:
                         user_data = result.get("data", {}).get("user", {})
-                        
+
                         # 提取需要的字段
                         mobile = user_data.get("mobile", "")
                         name = user_data.get("name", "")
                         en_name = user_data.get("en_name", "")
                         user_id = user_data.get("user_id", "")
-                        
+                        open_id = user_data.get("open_id", "")
+
                         # 处理姓名显示格式
-                        display_name = name
-                        if name and en_name:
-                            display_name = f"{name}（{en_name}）"
-                        elif en_name and not name:
-                            display_name = en_name
-                        
+                        display_name_mode = getattr(self.app_config, 'user_display_name_mode', 'name_with_en_name')
+                        if display_name_mode == "name_only":
+                            # 模式1：只用 name（不管是否为空）
+                            display_name = name
+                        else:
+                            # 模式2：当前逻辑（先查 name and en_name，然后 en_name and not name）
+                            display_name = name
+                            if name and en_name:
+                                display_name = f"{name}（{en_name}）"
+                            elif en_name and not name:
+                                display_name = en_name
+
                         logger.info(f"获取用户信息成功: {display_name} ({user_id})")
-                        
+
                         return {
                             "mobile": mobile,
                             "name": display_name,
                             "user_id": user_id,
+                            "open_id": open_id,
                             "success": True
                         }
                     else:
@@ -847,6 +855,7 @@ class FeishuBotService:
                             "mobile": "",
                             "name": "用户",
                             "user_id": user_id,
+                            "open_id": "",
                             "success": False
                         }
                         
@@ -854,8 +863,9 @@ class FeishuBotService:
             logger.error(f"获取用户信息异常: {str(e)}")
             return {
                 "mobile": "",
-                "name": "用户", 
+                "name": "用户",
                 "user_id": user_id,
+                "open_id": "",
                 "success": False
             }
 
@@ -1257,10 +1267,13 @@ class FeishuBotService:
             try:
                 from app.services.user_chat_session_service import UserChatSessionService
                 session_service = UserChatSessionService()
+                # 从user_info中提取open_id
+                open_id = user_info.get("open_id", "")
                 current_chat_id = session_service.get_current_chat_id(
                     app_id=self.app_id,
                     user_id=user_id,
-                    app_name=app_name
+                    app_name=app_name,
+                    open_id=open_id
                 )
                 logger.info(f"使用聊天会话ID: {current_chat_id}")
             except Exception as e:
